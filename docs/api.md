@@ -929,6 +929,48 @@ the re-render is a pure function of (props, request). Per-request
 state set by the action is visible to the re-render in the same
 request.
 
+### Flash form validation
+
+```go
+var ErrValidation = errors.New("render: validation error")
+
+// RenderContext (actions set, components read):
+func (rc *RenderContext) SetFormError(key, msg string)
+func (rc *RenderContext) GetFormError(key string) string
+func (rc *RenderContext) FormErrors() map[string]string
+func (rc *RenderContext) ClearFormErrors()
+
+// ComponentContext (same, ergonomic):
+func (c *ComponentContext) SetFormError(key, msg string)
+func (c *ComponentContext) GetFormError(key string) string
+
+// Default FuncMap helper (template engines):
+//   {{ formError "email" }} -> error message or ""
+```
+
+React `useActionState`-style validation without session cookies
+or redirects. The action records per-field errors via
+`rc.SetFormError`, returns `ErrValidation` (or wraps it —
+matched with `errors.Is`); `HandleAction` intercepts the sentinel
+and re-renders the component at **200** with the errors readable
+via `c.GetFormError`.
+
+**Why 200, not 422:** HTMX does not swap 4xx/5xx responses by
+default (it fires `htmx:responseError`); the 200 response is what
+lets HTMX swap the form containing the inline error spans.
+
+**Flash semantics:** errors live for exactly one request — set by
+the action, read by the re-render, cleared on pool reuse
+(`AcquireContext` calls `ClearFormErrors`). No persistence. Last
+write wins per key.
+
+**Storage:** `formErrors [8]formErrorKV` inline on RenderContext
+(zero alloc); beyond 8 entries spill to a heap slice (no panic,
+same pattern as the cascading-context stack).
+
+Any action error that is NOT `ErrValidation` returns 500
+unchanged.
+
 ---
 
 ## HTMX — first-class support

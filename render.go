@@ -219,6 +219,12 @@ func defaultFuncMap(rc *RenderContext) template.FuncMap {
 			}
 			return rc.GetContext(key)
 		},
+		"formError": func(key string) string {
+			if rc == nil {
+				return ""
+			}
+			return rc.GetFormError(key)
+		},
 	}
 }
 

@@ -3,6 +3,7 @@ package render
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
 	"net/http"
@@ -131,16 +132,25 @@ func (r *Registry) HandleAction(w http.ResponseWriter, req *http.Request) {
 
 	// Invoke the action, then re-render the component, both with
 	// the same per-request RenderContext so state set by the
-	// action is visible to the re-render.
+	// action (form errors, state) is visible to the re-render.
 	var buf bytes.Buffer
 	bw := AcquireWriter(&buf)
 	rc := AcquireContext(bw, req)
 	rc.Loader = r.DefaultLoader()
 	if err := fn(rc, props); err != nil {
-		ReleaseWriter(bw)
-		ReleaseContext(rc)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
+		if !errors.Is(err, ErrValidation) {
+			ReleaseWriter(bw)
+			ReleaseContext(rc)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		// Validation failure: the action recorded per-field
+		// errors via rc.SetFormError and returned ErrValidation.
+		// Fall through to the re-render — the errors are in rc
+		// and the component reads them via c.GetFormError. We
+		// return 200 (NOT 422): HTMX does not swap 4xx/5xx
+		// responses by default, it fires htmx:responseError and
+		// the form with inline errors would never appear.
 	}
 	if err := r.RenderComponent(bw, rc, component, props); err != nil {
 		ReleaseWriter(bw)

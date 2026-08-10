@@ -167,6 +167,18 @@ type RenderContext struct {
 	// so ComponentContext.ActionURL can generate absolute action
 	// URLs without a global. "" means the default prefix.
 	actionPrefix string
+
+	// formErrors holds flash validation errors for the current
+	// request. Set by actions via SetFormError; read by components
+	// via GetFormError during the re-render pass. Flash semantics:
+	// the errors live for exactly one request and are cleared on
+	// pool reuse (AcquireContext).
+	//
+	// The first formErrInlineCap errors land in the inline array
+	// (zero alloc); beyond that they spill into a heap slice.
+	formErrInline    [formErrInlineCap]formErrorKV
+	formErrOverflow  []formErrorKV
+	formErrN         int
 }
 
 // contextKV is one slot on the cascading-context stack. Stored
@@ -453,6 +465,7 @@ func AcquireContext(w ByteWriter, req *http.Request) *RenderContext {
 	// impossible.
 	rc.ctxPtr = 0
 	rc.actionPrefix = ""
+	rc.ClearFormErrors()
 	if rc.state == nil {
 		rc.state = NewState()
 	} else {
@@ -486,6 +499,7 @@ func ReleaseContext(rc *RenderContext) {
 	rc.suspenseOnce = sync.Once{}
 	rc.ctxPtr = 0
 	rc.actionPrefix = ""
+	rc.ClearFormErrors()
 	rcPool.Put(rc)
 }
 

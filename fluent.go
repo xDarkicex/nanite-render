@@ -195,6 +195,26 @@ func (c *ComponentContext) UseContext(key string) any {
 	return c.Context.GetContext(key)
 }
 
+// SetFormError records a flash validation error for a form field.
+// During a server-action re-render, the error is readable via
+// GetFormError and rendered inline. Flash semantics: the error
+// lives for this request only — cleared on pool reuse.
+func (c *ComponentContext) SetFormError(key, msg string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.SetFormError(key, msg)
+}
+
+// GetFormError returns the flash validation error for a form
+// field, or "" if none was set for this request.
+func (c *ComponentContext) GetFormError(key string) string {
+	if c == nil || c.Context == nil {
+		return ""
+	}
+	return c.Context.GetFormError(key)
+}
+
 // Render dispatches a named, registered component inline, writing to
 // this context's writer. The component receives a fresh
 // ComponentContext (same state, its own data). This is the

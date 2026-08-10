@@ -467,6 +467,27 @@ CRITICAL contract for generated code / docs: the framework does
 NOT persist state across requests. Actions mutate the user's
 storage; the re-render is a pure function of (props, request).
 
+### 9.2 Flash form validation (useActionState style)
+
+Actions record per-field errors with `rc.SetFormError(key, msg)`
+and return `render.ErrValidation` (or wrap it — matched with
+`errors.Is`). HandleAction intercepts the sentinel and re-renders
+the component at 200; the component reads the errors with
+`c.GetFormError(key)`. `{{ formError "key" }}` works in templates
+via the default FuncMap.
+
+- **200 not 422**: HTMX doesn't swap 4xx/5xx responses by default
+  (fires htmx:responseError). 200 is what makes the inline errors
+  appear.
+- **Flash semantics**: errors live one request — set by the
+  action, read by the re-render, cleared on pool reuse. No
+  cookies, no redirects, no persistence.
+- **Storage**: `[8]formErrorKV` inline array (zero alloc), spills
+  to a heap slice past 8.
+- Errors NOT matching ErrValidation → 500 unchanged.
+- `formerrors.go` — the sentinel, the array, Set/Get/FormErrors/
+  ClearFormErrors.
+
 ---
 
 ## 10. HTMX first-class support

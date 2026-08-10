@@ -392,6 +392,7 @@ nanite-render gives you a React-flavoured composition model in Go — components
 | `React.memo` | [`cr.Memoize(name, keyer)`](#per-component-memoization) |
 | `createPortal` (render elsewhere) | [`WithOOB(id)`](#out-of-band-swaps-hx-swap-oobtrue) — HTMX out-of-band swaps |
 | Server Actions (`"use server"`) | [`cr.Define(...).Action(name, fn)`](#colocated-server-actions-nextjs-server-actions-style) — colocated mutations, universal handler, secure by default |
+| `useActionState` / form validation | [`rc.SetFormError` / `c.GetFormError` + `ErrValidation`](#flash-form-validation-react-useactionstate-style) — flash errors, inline re-render, no cookies or redirects |
 | Inline composition (`<Navbar/>`) | [`c.Render("Navbar", props)`](#the-fluent-builder) |
 
 The same component runs identically from **templ**, **html/template**, **jade**, and **plain HTML** — the React layer is engine-agnostic.
@@ -764,6 +765,36 @@ mux.HandleFunc("/_nano/action/", reg.HandleAction)
 **The state contract (important):** the framework does **not** persist state across requests — that's the user's job (DB, session, cookie). The action mutates storage; the re-render is a pure function of (props, request). Per-request state set in the action *is* visible to the re-render in the same request. This is not React memory semantics.
 
 **Configuration:** the URL prefix defaults to `/_nano/action/`; override with `render.WithActionPrefix("/api/act/")`.
+
+### Flash form validation (React `useActionState` style)
+
+Validation errors flow action → re-render without session cookies or redirects. The action records per-field errors and returns `ErrValidation`; `HandleAction` intercepts it and re-renders the component at **200** with the errors readable inline:
+
+```go
+cr.Define("LOGIN_FORM").
+    Action("submit", func(rc *render.RenderContext, props map[string]any) error {
+        if !valid {
+            rc.SetFormError("email", "Invalid format")
+            rc.SetFormError("password", "Too short")
+            return fmt.Errorf("login: %w", render.ErrValidation) // wrapped ok
+        }
+        return nil
+    }).
+    Render(func(c *render.ComponentContext) error {
+        if e := c.GetFormError("email"); e != "" {
+            c.WriteString(`<span class="error">` + e + `</span>`)
+        }
+        // ...
+        return nil
+    }).
+    Register(cr)
+```
+
+**Why 200, not 422:** HTMX does not swap 4xx/5xx responses by default — it fires `htmx:responseError` and leaves the DOM untouched. The 200 response lets HTMX swap the form containing the inline error spans. (If you want 422 semantics, handle `htmx:responseError` client-side.)
+
+**Flash semantics:** errors live for exactly one request — the action sets them, the re-render reads them, and pool reuse clears them. No persistence, no cookies, no redirects. The errors are display state; the component re-renders from its own data source.
+
+**Implementation:** `formErrors [8]formErrorKV` inline array on `RenderContext` (zero alloc), spilling to a heap slice past 8. `SetFormError`/`GetFormError` on both `RenderContext` and `ComponentContext`, plus a `{{ formError "email" }}` default-FuncMap helper for template engines. Match the sentinel with `errors.Is` — any non-`ErrValidation` error still returns 500.
 
 ---
 
