@@ -150,12 +150,54 @@ func (r *Registry) renderPageEngines(rc *RenderContext, layoutEngine, layout, vi
 	viewRc.Variants = rc.Variants
 	viewRc.FuncMap = rc.FuncMap
 	viewRc.SetComponentRegistry(rc.ComponentRegistry())
+
+	// Metadata pre-flight: if the view name is a registered
+	// component with a Metadata closure, run it before the render
+	// walk so head metadata lands before anything streams. For
+	// most views this is redundant — components in the view can
+	// call SetTitle/AddMeta during their render — but it covers
+	// views that aren't registered components or metadata that
+	// must run unconditionally.
+	//
+	// Note: consult r.Components() directly — the render call
+	// below is what auto-populates viewRc's registry, so it's
+	// still nil here.
+	if cr := r.Components(); cr != nil {
+		if vc, ok := cr.Lookup(view); ok {
+			if mp, ok := vc.(MetadataProvider); ok {
+				if fn := mp.Metadata(); fn != nil {
+					if err := fn(viewRc, data); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
 	if err := r.Render(viewRc, viewEngine, view, data); err != nil {
 		return err
 	}
 	if err := viewBw.Flush(); err != nil {
 		return err
 	}
+
+	// Transfer head state and the id sequence from the view
+	// context to the main context: the layout renders with rc, so
+	// title/meta set during the view render (pass 1) must be
+	// visible to <NANO_HEAD/> in the layout (pass 2). The id
+	// sequence continues so page-wide UseId calls never collide.
+	rc.title = viewRc.title
+	inlineN := viewRc.metaN
+	if inlineN > metaInlineCap {
+		inlineN = metaInlineCap
+	}
+	for i := 0; i < inlineN; i++ {
+		rc.AddMeta(viewRc.metaTags[i].name, viewRc.metaTags[i].content)
+	}
+	for _, kv := range viewRc.metaOverflow {
+		rc.AddMeta(kv.name, kv.content)
+	}
+	rc.idSeq = viewRc.idSeq
 
 	// 2. Stash the view bytes for the yield() superpower. The layout's
 	//    html/template reads this via the FuncMap closure. We also
@@ -164,7 +206,14 @@ func (r *Registry) renderPageEngines(rc *RenderContext, layoutEngine, layout, vi
 	rc.ViewBytes = viewBuf.Bytes()
 	cr := rc.ComponentRegistry()
 	if cr == nil {
-		cr = NewComponentRegistry()
+		// Use the registry's components (built-ins like PRELOADS /
+		// NANO_HEAD plus anything attached). Creating a fresh empty
+		// registry here would silently drop them — it would also
+		// block renderNamed's auto-population later.
+		cr = r.Components()
+		if cr == nil {
+			cr = NewComponentRegistry()
+		}
 		rc.SetComponentRegistry(cr)
 	}
 	viewBytes := viewBuf.Bytes()

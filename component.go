@@ -414,6 +414,20 @@ func (r *ComponentRegistry) Define(name string) *Definition {
 // Attach binds a ComponentRegistry to a Registry. Components are
 // reachable via rc.Components() in the executor.
 func (r *Registry) AttachComponents(c *ComponentRegistry) {
+	// Carry the built-in components (PRELOADS, NANO_HEAD) into
+	// the user's registry so they don't silently disappear when a
+	// custom registry replaces the defaults. Users can still
+	// override a built-in by registering their own component
+	// under the same name AFTER attaching.
+	if prev := r.components.Load(); prev != nil && prev != c {
+		for _, name := range prev.Names() {
+			if _, ok := c.Lookup(name); !ok {
+				if comp, ok := prev.Lookup(name); ok {
+					c.Register(name, comp)
+				}
+			}
+		}
+	}
 	r.components.Store(c)
 }
 

@@ -179,6 +179,17 @@ type RenderContext struct {
 	formErrInline    [formErrInlineCap]formErrorKV
 	formErrOverflow  []formErrorKV
 	formErrN         int
+
+	// Head-management state for this request: the document title,
+	// collected <meta> tags, and the useId sequence. Set by
+	// components during the view render (or by a Metadata
+	// closure); emitted by the layout's <NANO_HEAD/> / {{ nanoHead }}
+	// injector. Cleared on pool reuse.
+	title          string
+	metaTags       [metaInlineCap]metaKV
+	metaOverflow   []metaKV
+	metaN          int
+	idSeq          int
 }
 
 // contextKV is one slot on the cascading-context stack. Stored
@@ -466,6 +477,7 @@ func AcquireContext(w ByteWriter, req *http.Request) *RenderContext {
 	rc.ctxPtr = 0
 	rc.actionPrefix = ""
 	rc.ClearFormErrors()
+	rc.ClearHeadState()
 	if rc.state == nil {
 		rc.state = NewState()
 	} else {
@@ -500,6 +512,7 @@ func ReleaseContext(rc *RenderContext) {
 	rc.ctxPtr = 0
 	rc.actionPrefix = ""
 	rc.ClearFormErrors()
+	rc.ClearHeadState()
 	rcPool.Put(rc)
 }
 

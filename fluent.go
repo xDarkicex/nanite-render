@@ -215,6 +215,38 @@ func (c *ComponentContext) GetFormError(key string) string {
 	return c.Context.GetFormError(key)
 }
 
+// SetTitle sets the document <title> for this request. On full
+// page loads the view renders before the layout, so the layout's
+// <NANO_HEAD/> (or {{ nanoHead }}) emits it. On HTMX partial
+// swaps, write `<title>` directly to the output instead — HTMX
+// hoists it from the response body.
+func (c *ComponentContext) SetTitle(title string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.SetTitle(title)
+}
+
+// AddMeta adds a <meta name="..." content="..."> tag for this
+// request, emitted by the layout's <NANO_HEAD/> on full page
+// loads. Last write wins per name.
+func (c *ComponentContext) AddMeta(name, content string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.AddMeta(name, content)
+}
+
+// UseId returns a unique per-request identifier ("nano-1", …)
+// for pairing <label for> with <input id>. Zero-alloc for the
+// first 256 ids.
+func (c *ComponentContext) UseId() string {
+	if c == nil || c.Context == nil {
+		return "nano-0"
+	}
+	return c.Context.UseId()
+}
+
 // Render dispatches a named, registered component inline, writing to
 // this context's writer. The component receives a fresh
 // ComponentContext (same state, its own data). This is the
@@ -343,6 +375,10 @@ type Definition struct {
 	// Action(name, fn). Keyed by action name; dispatched by
 	// Registry.HandleAction. nil when no actions are registered.
 	actions map[string]ActionFunc
+
+	// metadata is the head-metadata closure run before the page
+	// streams (see MetadataProvider). nil when not registered.
+	metadata func(rc *RenderContext, data any) error
 }
 
 // ErrorBoundaryFunc is the panic recovery callback for a component.
@@ -500,6 +536,32 @@ func (d *Definition) Action(name string, fn ActionFunc) *Definition {
 	return d
 }
 
+// Metadata registers a head-metadata closure that runs BEFORE
+// the page streams (see MetadataProvider). It receives the page
+// data and sets the document title / meta tags via
+// rc.SetTitle / rc.AddMeta; the layout's <NANO_HEAD/> (or
+// {{ nanoHead }}) emits them.
+//
+// For the common case this is redundant: components rendered in
+// the view can call c.SetTitle / c.AddMeta during their render —
+// the view renders before the layout in the two-pass page
+// pipeline, and the head state is transferred to the layout's
+// context. Metadata is for views that are NOT registered
+// components, or metadata that should run even if the render
+// walk is skipped.
+//
+//	fn := func(rc *render.RenderContext, data any) error {
+//	    user := data.(User)
+//	    rc.SetTitle(user.Name + " - Profile")
+//	    rc.AddMeta("description", "Profile page for " + user.Name)
+//	    return nil
+//	}
+//	cr.Define("USER_PROFILE").Metadata(fn).Render(...)
+func (d *Definition) Metadata(fn func(rc *RenderContext, data any) error) *Definition {
+	d.metadata = fn
+	return d
+}
+
 // Register finalises the definition and registers it with the
 // ComponentRegistry.
 func (d *Definition) Register(cr *ComponentRegistry) {
@@ -520,6 +582,7 @@ func (d *Definition) Register(cr *ComponentRegistry) {
 		async:        async,
 		errBoundary:  d.errBoundary,
 		actions:      d.actions,
+		metadata:     d.metadata,
 	}
 	cr.Register(d.name, c)
 }
@@ -564,6 +627,7 @@ type fluentComponent struct {
 	async        bool
 	errBoundary  ErrorBoundaryFunc
 	actions      map[string]ActionFunc
+	metadata     func(rc *RenderContext, data any) error
 }
 
 // OOBID implements OOBOptioner. Returns the target DOM element id
@@ -575,6 +639,12 @@ func (f *fluentComponent) OOBID() string { return f.oobID }
 func (f *fluentComponent) LookupAction(name string) (ActionFunc, bool) {
 	fn, ok := f.actions[name]
 	return fn, ok
+}
+
+// Metadata implements MetadataProvider. Returns the head-metadata
+// closure registered via Definition.Metadata, or nil.
+func (f *fluentComponent) Metadata() func(rc *RenderContext, data any) error {
+	return f.metadata
 }
 
 // ErrorBoundary returns the panic recovery callback registered via

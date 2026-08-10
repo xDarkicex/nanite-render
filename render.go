@@ -178,10 +178,16 @@ func NewRegistry(engines ...Engine) *Registry {
 	// want custom emission.
 	r.components.Store(NewComponentRegistry())
 	r.components.Load().Register("PRELOADS", &preloadsComponent{r: r})
+	// NANO_HEAD is the head-metadata injector: place <NANO_HEAD/>
+	// inside the layout's <head> to emit the title/meta tags
+	// collected via SetTitle/AddMeta. Same pattern as PRELOADS —
+	// users may override via AttachComponents for custom emission.
+	r.components.Load().Register("NANO_HEAD", &nanoHeadComponent{})
 	// Register a default FuncMap builder so templates get the
-	// standard helpers (useState, get, set, useContext) without
-	// any opt-in. Users can call WithFuncMap to merge their own
-	// helpers on top — see Registry.FuncMap for the merge logic.
+	// standard helpers (useState, get, set, useContext, formError,
+	// nanoHead) without any opt-in. Users can call WithFuncMap to
+	// merge their own helpers on top — see Registry.FuncMap for
+	// the merge logic.
 	r.FuncMap(defaultFuncMap)
 	return r
 }
@@ -224,6 +230,9 @@ func defaultFuncMap(rc *RenderContext) template.FuncMap {
 				return ""
 			}
 			return rc.GetFormError(key)
+		},
+		"nanoHead": func() string {
+			return headTagsString(rc)
 		},
 	}
 }

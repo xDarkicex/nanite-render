@@ -973,6 +973,55 @@ unchanged.
 
 ---
 
+## Deep Document Head Management
+
+```go
+// RenderContext / ComponentContext:
+func (rc *RenderContext) SetTitle(title string)
+func (rc *RenderContext) Title() string
+func (rc *RenderContext) AddMeta(name, content string)
+func (c *ComponentContext) SetTitle(title string)
+func (c *ComponentContext) AddMeta(name, content string)
+func (c *ComponentContext) UseId() string
+
+// MetadataProvider (fluent builder: Definition.Metadata(fn)):
+type MetadataProvider interface {
+    Component
+    Metadata() func(rc *RenderContext, data any) error
+}
+
+// Built-in component + FuncMap helper:
+//   <NANO_HEAD/>   (plain HTML)   — emits title + meta
+//   {{ nanoHead }} (template)     — same
+```
+
+Head state (`title string`, `metaTags [16]metaKV` + spillover,
+`idSeq int`) lives on RenderContext — zero-alloc inline arrays.
+
+Full page loads: the two-pass pipeline renders the view before
+the layout streams, so components in the view can call
+`c.SetTitle`/`c.AddMeta` during their render; `renderPageEngines`
+transfers the head state (and the id sequence) from the view
+context to the layout context before the layout renders. The
+layout's `<NANO_HEAD/>` (or `{{ nanoHead }}`) emits the tags
+inline. Values are HTML-escaped; AddMeta is last-write-wins per
+name.
+
+`Metadata` closures run before the render walk when the view
+name matches a registered component (consulting
+`r.Components()` directly — the view context's registry isn't
+populated yet at that point).
+
+HTMX partial swaps: HTMX hoists `<title>` tags from response
+bodies; write them directly in component output. Meta tags use
+`hx-swap-oob="true"`.
+
+`UseId` returns "nano-N" per-request unique ids; the first 256
+come from a precomputed static array (zero alloc); the sequence
+continues across the view → layout boundary.
+
+---
+
 ## HTMX — first-class support
 
 nanite-render implements 100% of the HTMX 2.0 server-side contract.

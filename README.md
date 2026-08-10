@@ -393,6 +393,8 @@ nanite-render gives you a React-flavoured composition model in Go — components
 | `createPortal` (render elsewhere) | [`WithOOB(id)`](#out-of-band-swaps-hx-swap-oobtrue) — HTMX out-of-band swaps |
 | Server Actions (`"use server"`) | [`cr.Define(...).Action(name, fn)`](#colocated-server-actions-nextjs-server-actions-style) — colocated mutations, universal handler, secure by default |
 | `useActionState` / form validation | [`rc.SetFormError` / `c.GetFormError` + `ErrValidation`](#flash-form-validation-react-useactionstate-style) — flash errors, inline re-render, no cookies or redirects |
+| `<Head>` / `generateMetadata` | [`c.SetTitle` / `c.AddMeta` + `<NANO_HEAD/>`](#deep-document-head-management-nextjs-head) — two-pass head injection, no body buffering |
+| `useId` | [`c.UseId()`](#stable-server-side-ids-useid) — per-request unique ids, zero-alloc first 256 |
 | Inline composition (`<Navbar/>`) | [`c.Render("Navbar", props)`](#the-fluent-builder) |
 
 The same component runs identically from **templ**, **html/template**, **jade**, and **plain HTML** — the React layer is engine-agnostic.
@@ -795,6 +797,53 @@ cr.Define("LOGIN_FORM").
 **Flash semantics:** errors live for exactly one request — the action sets them, the re-render reads them, and pool reuse clears them. No persistence, no cookies, no redirects. The errors are display state; the component re-renders from its own data source.
 
 **Implementation:** `formErrors [8]formErrorKV` inline array on `RenderContext` (zero alloc), spilling to a heap slice past 8. `SetFormError`/`GetFormError` on both `RenderContext` and `ComponentContext`, plus a `{{ formError "email" }}` default-FuncMap helper for template engines. Match the sentinel with `errors.Is` — any non-`ErrValidation` error still returns 500.
+
+---
+
+## Deep Document Head Management (Next.js `<Head>`)
+
+A deeply nested component can inject `<title>` / `<meta>` into the document head — without buffering the body or hurting TTFB.
+
+**How it works:** the two-pass page pipeline already renders the view *before* the layout streams (that's what `yield` needs). So any component in the view can call `c.SetTitle` / `c.AddMeta` during its render, and the head state is transferred to the layout's context before it streams. The layout places `<NANO_HEAD/>` (plain HTML) or `{{ nanoHead }}` (template engines) inside `<head>` — it emits the collected tags inline, zero allocation:
+
+```go
+cr.Define("USER_PROFILE").
+    Render(func(c *render.ComponentContext) error {
+        user := c.Data.(User)
+        c.SetTitle(user.Name + " - Profile")                    // → <title>…</title>
+        c.AddMeta("description", "Profile page for " + user.Name) // → <meta name=…>
+        return c.WriteString(`<div>…</div>`)
+    }).
+    Register(cr)
+```
+
+```html
+<!-- layouts/app.html -->
+<html>
+  <head><NANO_HEAD/></head>   <!-- emits title + meta collected during the view -->
+  <body>{{ yield }}</body>
+</html>
+```
+
+Values are HTML-escaped (user data in head tags is an injection vector). `AddMeta` is last-write-wins per name; up to 16 meta tags live in a zero-alloc inline array, spilling to a heap slice past that.
+
+**`Metadata` pre-flight** (optional): `cr.Define("PROFILE").Metadata(func(rc *render.RenderContext, data any) error { rc.SetTitle(...) })` runs *before* the render walk when the view name matches the component name. Mostly redundant with the two-pass transfer above, but covers views that aren't registered components or metadata that must run unconditionally.
+
+**HTMX partial swaps:** HTMX hoists `<title>` tags from response bodies automatically — a component on an `hx-get` can just `c.WriteString("<title>Saved!</title>")` and the tab title updates. Meta tags use `hx-swap-oob="true"` (htmx 2.0 head merge).
+
+### Stable server-side IDs (`useId`)
+
+```go
+cr.Define("INPUT_FIELD").
+    Render(func(c *render.ComponentContext) error {
+        id := c.UseId() // "nano-1", "nano-2", …
+        c.WriteString(`<label for="` + id + `">Name</label>`)
+        c.WriteString(`<input id="` + id + `" type="text">`)
+        return nil
+    })
+```
+
+The first 256 ids come from a precomputed static array — zero allocation. The sequence is per-request (reset on pool reuse) and continues across the view → layout boundary so page-wide ids never collide. Unlike React, ids are a per-request sequence rather than stable per component instance — uniqueness (what label/input pairing needs) is what's guaranteed.
 
 ---
 

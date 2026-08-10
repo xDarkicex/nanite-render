@@ -488,6 +488,35 @@ via the default FuncMap.
 - `formerrors.go` — the sentinel, the array, Set/Get/FormErrors/
   ClearFormErrors.
 
+### 9.3 Deep head management + useId
+
+Components inject `<title>`/`<meta>` into the document head
+without buffering the body:
+
+- `c.SetTitle(...)` / `c.AddMeta(name, content)` collect head
+  state on the RenderContext (`title string`, `metaTags
+  [16]metaKV` + spillover — zero alloc).
+- The two-pass page pipeline renders the view BEFORE the layout
+  streams, so view components can set head state during their
+  render; `renderPageEngines` transfers title/meta/idSeq from
+  the view context to the layout context before the layout
+  renders.
+- The layout places `<NANO_HEAD/>` (plain HTML, built-in
+  component) or `{{ nanoHead }}` (template FuncMap) inside
+  `<head>`; it emits the collected tags inline. Values are
+  HTML-escaped; AddMeta is last-write-wins per name.
+- `Metadata` closures (Definition.Metadata) run before the
+  render walk when the view name matches a registered component.
+  Consult `r.Components()` directly there — the view context's
+  registry isn't populated yet at that point.
+- HTMX partial swaps: HTMX hoists `<title>` from response
+  bodies; write them directly in component output.
+- `c.UseId()` → "nano-N" per-request ids; first 256 from a
+  precomputed static array (zero alloc); sequence continues
+  across the view → layout boundary.
+- `head.go` — the injector component, Set/Add/Title/UseId,
+  precomputed ids, MetadataProvider.
+
 ---
 
 ## 10. HTMX first-class support
