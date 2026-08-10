@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"fmt"
 	"html"
 	"html/template"
 	"strings"
@@ -180,6 +181,28 @@ func Props[T any](c *ComponentContext) T {
 // the render arguments.
 type ComponentRenderFunc func(c *ComponentContext) error
 
+// panicValue is a sentinel error wrapping a recovered panic value.
+// The boundary path checks for this type to distinguish "user
+// render panicked" from "user render returned an error". The
+// underlying value is exposed via Val() so the boundary sees the
+// raw panic (any) without it being wrapped in an interface
+// assertion dance.
+type panicValue struct {
+	val any
+}
+
+// Error implements error so panicValue can flow through the same
+// error-returning code path as a regular Render error.
+func (p *panicValue) Error() string {
+	if e, ok := p.val.(error); ok {
+		return e.Error()
+	}
+	return fmt.Sprintf("panic: %v", p.val)
+}
+
+// Val returns the raw panic value passed to panic().
+func (p *panicValue) Val() any { return p.val }
+
 // Definition is the fluent builder for a single component. It is
 // returned by cr.Define(name) and chained with WithFuncs, Render,
 // and RenderChildren. The definition is finalised by calling
@@ -212,7 +235,33 @@ type Definition struct {
 	// fallback is the synchronous placeholder rendered inline before
 	// the async render finishes. Required when async is true.
 	fallback ComponentRenderFunc
+
+	// errBoundary is the panic recovery callback. When non-nil, the
+	// component's Render runs inside a deferred recover; if it
+	// panics, the boundary is invoked with the panic value and the
+	// rest of the page continues rendering. nil means no boundary
+	// — the render runs on the existing fast path with zero
+	// defer/recover overhead.
+	errBoundary ErrorBoundaryFunc
 }
+
+// ErrorBoundaryFunc is the panic recovery callback for a component.
+// It receives the ComponentContext (a fresh one pointing at the
+// same underlying writer as the failed render) and the raw panic
+// value (any — string, error, *runtime.Error, etc.). Returning nil
+// swallows the panic and lets page rendering continue; returning a
+// non-nil error propagates it.
+//
+// The boundary's writes land in the live response, NOT in the
+// discarded buffer the panicking render was using. This keeps the
+// rest of the page intact — only the failed component's output is
+// replaced.
+//
+// Security note: the panic value is the raw value passed to
+// panic(). Boundaries that print it to the response must take care
+// not to leak internal state (DB errors with credentials, stack
+// traces, etc.) to end users.
+type ErrorBoundaryFunc func(c *ComponentContext, err any) error
 
 // WithFuncs declares the per-component FuncMap. The FuncMap is
 // available to the component's Render via the render state
@@ -299,6 +348,31 @@ func (d *Definition) Fallback(fn ComponentRenderFunc) *Definition {
 	return d
 }
 
+// ErrorBoundary installs a panic recovery callback for this
+// component. When set, the component's Render runs inside a
+// deferred recover; a panic invokes fn with the panic value, the
+// failed render's buffer is discarded, and fn's output replaces
+// the failed component in the page. The rest of the render tree
+// continues normally.
+//
+// Components without ErrorBoundary run on the existing fast path
+// (no defer/recover overhead).
+//
+//	fn := func(c *render.ComponentContext, err any) error {
+//	    log.Printf("widget failed: %v", err) // safe to log
+//	    return c.WriteString(`<div class="error">Widget unavailable</div>`)
+//	}
+//	cr.Define("DASHBOARD_WIDGET").ErrorBoundary(fn).Render(...)
+//
+// If fn itself panics or returns an error, a generic
+// `<!-- error boundary failed -->` placeholder is emitted so the
+// page never crashes. This is the silent-fallback contract
+// documented in the design.
+func (d *Definition) ErrorBoundary(fn ErrorBoundaryFunc) *Definition {
+	d.errBoundary = fn
+	return d
+}
+
 // Register finalises the definition and registers it with the
 // ComponentRegistry.
 func (d *Definition) Register(cr *ComponentRegistry) {
@@ -317,6 +391,7 @@ func (d *Definition) Register(cr *ComponentRegistry) {
 		withChildren: d.withChildren,
 		oobID:        d.oobID,
 		async:        async,
+		errBoundary:  d.errBoundary,
 	}
 	cr.Register(d.name, c)
 }
@@ -359,11 +434,19 @@ type fluentComponent struct {
 	withChildren bool
 	oobID        string
 	async        bool
+	errBoundary  ErrorBoundaryFunc
 }
 
 // OOBID implements OOBOptioner. Returns the target DOM element id
 // when the component was declared with WithOOB(), or "" otherwise.
 func (f *fluentComponent) OOBID() string { return f.oobID }
+
+// ErrorBoundary returns the panic recovery callback registered via
+// Definition.ErrorBoundary, or nil if no boundary was set. The
+// async worker checks this to decide whether to invoke the
+// boundary on render failure (writing its output as the OOB
+// payload) or silently drop the failed chunk.
+func (f *fluentComponent) ErrorBoundary() ErrorBoundaryFunc { return f.errBoundary }
 
 // IsAsync reports whether the component declared Async(). The
 // executor checks this to decide whether to dispatch via the
@@ -429,24 +512,61 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 		defer func() { rc.ComponentFuncMap = prev }()
 	}
 
-	// Fast path: no OOB → render directly to the original writer.
-	if f.oobID == "" {
+	// Error boundary fast path: if no boundary is registered AND
+	// no OOB is needed, render directly with no defer/recover
+	// overhead. This is the common case.
+	if f.errBoundary == nil && f.oobID == "" {
 		ctx := f.buildCtx(w, rc, data, "")
 		return f.fn(ctx)
 	}
 
-	// OOB path: render to a pooled buffer, then decide whether to
-	// wrap based on whether SetState was called during the render.
+	// Isolated-buffer path: render to a pooled buffer so we can
+	// discard the bytes on panic (without leaking a half-written
+	// <div> into the live response). The buffer is shared by both
+	// the boundary-enabled and OOB-enabled paths.
 	buf := acquireOOBBuffer()
 	defer releaseOOBBuffer(buf)
 	bw := AcquireWriter(buf)
 	defer ReleaseWriter(bw)
-
 	ctx := f.buildCtx(bw, rc, data, f.oobID)
-	if err := f.fn(ctx); err != nil {
-		return err
+
+	var renderErr error
+	if f.errBoundary != nil {
+		// Wrap the user's render in a deferred recover. If it
+		// panics, the panic value is captured and the boundary
+		// is invoked below. We use a named function so the
+		// deferred recover is scoped to the user's render ONLY
+		// — not to the surrounding code (defers in the rest of
+		// Render still fire normally).
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					renderErr = &panicValue{val: r}
+				}
+			}()
+			renderErr = f.fn(ctx)
+		}()
+	} else {
+		renderErr = f.fn(ctx)
 	}
-	// Drain the wrapper buffer so its bytes are visible.
+
+	// Panic path: discard buf, invoke boundary. The boundary
+	// writes to the LIVE writer (w), so the failed component's
+	// bytes are replaced by the boundary output in the response.
+	if pe, ok := renderErr.(*panicValue); ok {
+		if f.errBoundary != nil {
+			return f.runBoundary(w, rc, data, pe.val)
+		}
+		// No boundary registered — surface the panic. Re-panic
+		// so the runtime prints a stack trace and the request
+		// handler can decide what to do.
+		panic(pe.val)
+	}
+	if renderErr != nil {
+		return renderErr
+	}
+	// Drain the wrapper buffer so its bytes are visible to the
+	// OOB / boundary handling below.
 	if err := bw.Flush(); err != nil {
 		return err
 	}
@@ -524,6 +644,36 @@ func getCompState(rc *RenderContext) *State {
 		return nil
 	}
 	return rc.ComponentState()
+}
+
+// runBoundary invokes the panic recovery callback. The boundary
+// receives a fresh ComponentContext pointing at the LIVE writer
+// (not the discarded buffer) so its writes land directly in the
+// response, replacing the failed component's bytes.
+//
+// If the boundary itself panics or returns an error, a generic
+// `<!-- error boundary failed -->` placeholder is emitted so the
+// page never crashes — this is the documented silent-fallback
+// contract.
+func (f *fluentComponent) runBoundary(w ByteWriter, rc *RenderContext, data any, panicVal any) (returnErr error) {
+	// The boundary might also panic. Wrap its execution in a
+	// deferred recover so even a buggy boundary can't crash the
+	// page. The outer recover guarantees the response always
+	// contains SOMETHING where the failed component was.
+	defer func() {
+		if r := recover(); r != nil {
+			_, _ = w.WriteString(`<!-- error boundary failed -->`)
+		}
+	}()
+	ctx := f.buildCtx(w, rc, data, f.oobID)
+	if err := f.errBoundary(ctx, panicVal); err != nil {
+		// Boundary returned an error rather than panicking.
+		// Same fallback: write a generic placeholder so we don't
+		// crash the page render.
+		_, _ = w.WriteString(`<!-- error boundary failed -->`)
+		return nil
+	}
+	return nil
 }
 
 // ComponentFuncs returns the per-component FuncMap if set.

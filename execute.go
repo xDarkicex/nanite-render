@@ -407,12 +407,21 @@ func emitAsyncComponent(w ByteWriter, rc *RenderContext, c Component, id string,
 			return err
 		}
 	}
+	// Extract the panic boundary (if any) so the worker can invoke
+	// it on render failure. Components that don't implement this
+	// interface fall back to silent-drop behaviour.
+	var boundary ErrorBoundaryFunc
+	if bComp, ok := c.(interface {
+		ErrorBoundary() ErrorBoundaryFunc
+	}); ok {
+		boundary = bComp.ErrorBoundary()
+	}
 	// Flush so the fallback chunk hits the wire immediately.
 	if fw, ok := w.(interface{ Flush() error }); ok {
 		_ = fw.Flush()
 	}
 	// Spawn the worker. The coordinator handles cancellation, the
-	// pooled buffer, and the OOB chunk wrapping.
-	rc.SubmitAsync(id, fn, data)
+	// pooled buffer, the OOB chunk wrapping, and the boundary.
+	rc.SubmitAsync(id, fn, boundary, data)
 	return nil
 }

@@ -278,6 +278,45 @@ paints the shell while the worker runs).
 Cancellation is wired through `rc.Request.Context()` — a client
 disconnect aborts the worker and releases its pooled buffer.
 
+### 6.2 Error Boundaries (panic isolation)
+
+A panic inside a component used to crash the whole request.
+`ErrorBoundary` opts a component into graceful degradation:
+
+```go
+cr.Define("WIDGET").
+    ErrorBoundary(func(c *render.ComponentContext, err any) error {
+        log.Printf("widget failed: %v", err)
+        return c.WriteString(`<div class="error">Widget unavailable</div>`)
+    }).
+    Render(func(c *render.ComponentContext) error {
+        // Panic here only kills THIS component. The rest of the
+        // page keeps rendering.
+        panic("database timeout")
+    })
+```
+
+Mechanics: the component's render runs into an isolated buffer
+(same pattern as `WithOOB`). On panic, the buffer is discarded,
+the boundary is invoked with a fresh context pointing at the live
+response, and the boundary's writes replace the failed component
+in the page.
+
+Async components honor the boundary the same way — a worker
+panic invokes the boundary against the worker's pooled buffer,
+and the boundary's output replaces the expected OOB chunk. A
+panic in the boundary itself (or a non-nil error return) falls
+back to a generic `<!-- error boundary failed -->` placeholder.
+
+`err` is the raw panic value (`any`). Safe to log; do NOT echo
+it into the response without scrubbing — it may contain DB
+errors with credentials, stack traces, etc.
+
+Components WITHOUT a boundary keep the existing fast path — no
+`defer/recover` overhead is paid unless a boundary is
+registered. For development-time loud failures, omit the
+boundary and let the panic propagate.
+
 ---
 
 ## 7. Sharp edges

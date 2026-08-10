@@ -503,6 +503,39 @@ on the non-async path.
 
 ---
 
+## Error Boundaries (panic isolation)
+
+```go
+// Definition (fluent builder):
+func (d *Definition) ErrorBoundary(fn ErrorBoundaryFunc) *Definition
+
+type ErrorBoundaryFunc func(c *ComponentContext, err any) error
+```
+
+A panic inside a component's render normally kills the whole
+request. `ErrorBoundary` opts the component into graceful
+degradation: the render runs into an isolated buffer; on panic
+the buffer is discarded, the boundary is invoked with a fresh
+context pointing at the live response, and the boundary's
+writes replace the failed component's bytes in the page.
+
+Components without a boundary keep the existing fast path —
+no `defer/recover` overhead is paid unless a boundary is
+registered.
+
+Async components honor the boundary the same way: a worker
+panic invokes the boundary against the worker's pooled buffer,
+and the boundary's output replaces the expected OOB chunk.
+A panic in the boundary itself (or a non-nil error return)
+falls back to a generic `<!-- error boundary failed -->`
+placeholder so the page never crashes.
+
+The `err` value passed to the boundary is the raw panic value
+(`any` — string, error, `*runtime.Error`, custom struct). It's
+safe to log; do not echo it into the response without scrubbing.
+
+---
+
 ## SoA NodeStream
 
 ### `NodeStream`

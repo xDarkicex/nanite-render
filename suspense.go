@@ -160,9 +160,15 @@ func (rc *RenderContext) Suspense() *suspenseCoordinator {
 // fn is the render function captured by the component definition.
 // data is the per-call props.
 //
+// boundary is the panic recovery callback. When non-nil, a panic
+// in fn triggers boundary(bufWriter, panicVal) inside the worker;
+// the boundary's output replaces fn's output as the OOB payload.
+// A panic in the boundary itself is swallowed and a generic
+// placeholder OOB is emitted so the page never crashes.
+//
 // SubmitAsync is a no-op when the coordinator is nil or when the
 // context is already cancelled.
-func (rc *RenderContext) SubmitAsync(id string, fn func(w ByteWriter, rc *RenderContext, data any) error, data any) {
+func (rc *RenderContext) SubmitAsync(id string, fn func(w ByteWriter, rc *RenderContext, data any) error, boundary ErrorBoundaryFunc, data any) {
 	if rc == nil || rc.suspense == nil {
 		return
 	}
@@ -173,7 +179,7 @@ func (rc *RenderContext) SubmitAsync(id string, fn func(w ByteWriter, rc *Render
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.runWorker(id, fn, data)
+		c.runWorker(id, fn, boundary, data)
 	}()
 }
 
@@ -324,8 +330,10 @@ release:
 // runWorker is the per-async-component goroutine. It runs fn into a
 // pooled buffer, then submits the finished payload to the
 // coordinator. If the context is cancelled before fn finishes, the
-// worker exits without submitting.
-func (c *suspenseCoordinator) runWorker(id string, fn func(w ByteWriter, rc *RenderContext, data any) error, data any) {
+// worker exits without submitting. If fn panics and a boundary is
+// provided, the boundary is invoked (writing into the same pooled
+// buffer) and its output is submitted as the OOB payload.
+func (c *suspenseCoordinator) runWorker(id string, fn func(w ByteWriter, rc *RenderContext, data any) error, boundary ErrorBoundaryFunc, data any) {
 	// Acquire a buffer from the pool.
 	buf := c.bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -348,15 +356,43 @@ func (c *suspenseCoordinator) runWorker(id string, fn func(w ByteWriter, rc *Ren
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- errPanic
+				done <- &panicValue{val: r}
 			}
 		}()
 		done <- fn(wrc.Writer, wrc, data)
 	}()
 	select {
 	case err := <-done:
-		if err == errPanic {
-			// User render panicked. Don't submit.
+		if pe, ok := err.(*panicValue); ok {
+			// User render panicked. Try the boundary if one
+			// is registered. On success, submit the boundary
+			// output as the OOB payload so the client sees a
+			// consistent error shape (wrapped OOB chunk).
+			// On failure (no boundary or boundary also
+			// panicked), submit a generic placeholder OOB.
+			if boundary != nil {
+				buf.Reset() // discard failed render's bytes
+				bw := &bufferByteWriter{buf: buf}
+				bwr := &RenderContext{Writer: bw}
+				if berr := func() (rerr error) {
+					defer func() {
+						if r := recover(); r != nil {
+							rerr = &panicValue{val: r}
+						}
+					}()
+					return boundary(&ComponentContext{Writer: bw, Context: bwr, Data: data}, pe.val)
+				}(); berr != nil {
+					// Boundary itself panicked or returned an
+					// error. Emit the generic placeholder.
+					buf.Reset()
+					_, _ = bw.WriteString(`<!-- error boundary failed -->`)
+				}
+				c.ch <- &suspensePayload{id: id, buf: buf, err: nil}
+				return
+			}
+			// No boundary — silently drop. Same behavior as
+			// before this feature: a panic in an async worker
+			// just doesn't deliver an OOB chunk.
 			buf.Reset()
 			c.bufPool.Put(buf)
 			return
@@ -368,15 +404,6 @@ func (c *suspenseCoordinator) runWorker(id string, fn func(w ByteWriter, rc *Ren
 		c.bufPool.Put(buf)
 	}
 }
-
-// errPanic is a sentinel value used to signal that the user's
-// render panicked. We can't safely pass the panic through the
-// channel as an error (the panic value may not implement error).
-var errPanic = &panicError{}
-
-type panicError struct{}
-
-func (p *panicError) Error() string { return "panic in async component render" }
 
 // bufferByteWriter adapts a *bytes.Buffer to the ByteWriter interface
 // without going through the global pool. Used by async workers so

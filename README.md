@@ -498,6 +498,7 @@ Every engine gets the framework's cross-cutting superpowers automatically:
 | `useState` | `{{ useState "count" 0 }}` | React-style per-render state |
 | `get` / `set` | `{{ get "count" }}` / `{{ set "count" 5 }}` | State access |
 | `<SLOW_DATA/>` with `Async()` + `Fallback()` | Server-side Suspense — fallback hits the wire immediately, real output streams as an HTMX OOB chunk when the worker finishes | Turns `Sum(component_times)` into `Max(component_times)` |
+| `ErrorBoundary(fn)` on a `Definition` | Isolates panics in the component's render — boundary runs against a fresh context, the failed component's bytes are discarded, the rest of the page continues | One broken widget never kills the whole request |
 
 The `component` and `yield` superpowers are injected into the FuncMap of any engine that compiles via html/template (jade, html-template). The plain HTML engine uses the SoA executor's native `<COMPONENT/>` dispatch instead.
 
@@ -623,6 +624,37 @@ The win: `Sum(component_times)` becomes `Max(component_times)` for independent c
 The coordinator is **lazy** — zero channels, zero goroutines, zero allocations on the non-async path. Use `rc.Suspense()` to inspect whether suspense is in flight.
 
 Call `rc.CloseSuspense()` after the render walk completes (typically in a `defer` in the handler) so the trailing OOB chunks flush before the response closes.
+
+---
+
+## Error Boundaries (panic isolation)
+
+A panic deep inside a component used to crash the whole request. With `ErrorBoundary()`, only the failed component is replaced — the rest of the page renders normally.
+
+```go
+cr.Define("DASHBOARD_WIDGET").
+    ErrorBoundary(func(c *render.ComponentContext, err any) error {
+        // Safe to log the raw panic value (it's the unfiltered
+        // value passed to panic()). Be careful NOT to echo it
+        // directly into the response — internal errors may
+        // contain credentials, stack traces, etc.
+        log.Printf("widget failed: %v", err)
+        return c.WriteString(`<div class="error">Widget unavailable</div>`)
+    }).
+    Render(func(c *render.ComponentContext) error {
+        // If this panics, only THIS component fails. The rest of
+        // the page keeps rendering.
+        panic("database timeout")
+    })
+```
+
+**How it works:** the component's render runs into an isolated buffer (same pattern as `WithOOB`). On panic, the buffer is discarded, the boundary is invoked with a fresh context pointing at the live response, and the boundary's writes replace the failed component in the page. Zero overhead for components without a boundary — no `defer/recover` is set up unless one is registered.
+
+**Async + ErrorBoundary:** workers that panic invoke their boundary too. The boundary's output replaces the expected OOB chunk, so the client sees a consistent error shape (`<div id="..." hx-swap-oob="true">...error...</div>`). A panic in the boundary itself falls back to a generic `<!-- error boundary failed -->` placeholder so the page never crashes.
+
+**Nested safety:** the boundary call is itself wrapped in `defer/recover`. If the boundary panics or returns an error, the generic placeholder is emitted and rendering continues.
+
+**Without a boundary:** a panic re-panics out of the component (sync) or silently drops the OOB chunk (async). Use boundaries when you want graceful degradation; rely on re-panic when you want loud failures during development.
 
 ---
 
