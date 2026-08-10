@@ -24,16 +24,20 @@ func (h *HTML) Name() string {
 }
 
 // Compile parses src via render.ParseHTML. The NodeStream is stored
-// in Program.Nodes; the SoA executor walks it at render time.
+// in Program.Nodes, and a flat Bytecode is compiled from it — the
+// executor runs the bytecode (coalesced static writes) instead of the
+// tree walk.
 func (h *HTML) Compile(src []byte, name string) (*render.Program, error) {
 	b, err := render.ParseHTML(src, name)
 	if err != nil {
 		return nil, err
 	}
+	stream := b.Stream()
 	return &render.Program{
-		Engine: h.Name(),
-		Name:   name,
-		Nodes:  b.Stream(),
+		Engine:   h.Name(),
+		Name:     name,
+		Nodes:    stream,
+		Bytecode: render.CompileBytecode(stream),
 	}, nil
 }
 

@@ -7,14 +7,18 @@ import (
 	"unsafe"
 )
 
-// Execute walks the NodeStream rooted at index 0 and writes the
-// rendered output to w. The walk is depth-first, pre-order, and
-// linear-time (O(n)): each node's children are reached via the
-// FirstChild/NextSibling links built at compile time, so the render
-// visits every node exactly once with no re-scans.
+// Execute renders the program to w. When the program carries a
+// compiled Bytecode (see CompileBytecode), the flat instruction
+// stream is executed — static HTML is coalesced into a few writes,
+// matching templ's compile-to-output speed. Otherwise the NodeStream
+// is walked depth-first via the FirstChild/NextSibling links
+// (linear-time, zero-alloc for hand-built streams).
 func Execute(p *Program, w ByteWriter, rc *RenderContext, data any) error {
 	if p == nil {
 		return errNilProgram
+	}
+	if p.Bytecode != nil {
+		return p.Bytecode.Exec(w, rc, data)
 	}
 	if p.Nodes.Count == 0 {
 		return nil

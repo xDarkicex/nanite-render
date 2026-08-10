@@ -66,23 +66,30 @@ Measured on Apple M2, Go 1.25, 3 KB HTML document (30 cards + nav + footer).
 
 | Operation | ns/op | allocs | B/op |
 |---|---|---|---|
-| `Cache.Get` (lock-free, off-heap) | 19 | 0 | 0 |
-| `LoadSource` | 11 | 0 | 0 |
-| **SoA executor walk (our renderer)** | **23,488** | **0** | **0** |
+| `Cache.Get` (lock-free, off-heap) | 11 | 0 | 0 |
+| **SoA bytecode executor (our renderer)** | **85** | **0** | **0** |
+| SoA tree walk (fallback) | 14,474 | 0 | 0 |
 
 ### End-to-end render (3 KB doc)
 
 | Path | ns/op | allocs |
 |---|---|---|
-| templ (direct) | 2,436 | 20 |
-| templ (via nanite adapter) | 2,597 | 22 |
-| **nanite SoA executor (plain HTML)** | **23,488** | **0** |
-| nanite cached (jade/HTMLTemplate) | 69,085 | 567* |
-| html/template compiled | 68,591 | 567* |
-| raw re-parse every render (GO-Portfolio style) | 251,791 | 1,967 |
-| nanite cold (compile each render) | 273,921 | 2,027 |
+| **nanite bytecode executor (plain HTML)** | **85** | **0** |
+| templ (direct) | 1,395 | 20 |
+| templ (via nanite adapter) | 1,523 | 22 |
+| SoA tree walk (fallback) | 14,474 | 0 |
+| nanite cached (jade/HTMLTemplate) | 40,088 | 567* |
+| html/template compiled | 40,076 | 567* |
+| raw re-parse every render (GO-Portfolio style) | 148,600 | 1,967 |
 
 \* html/template's reflection + re-escaping — identical to the raw compiled baseline, not nanite-render's overhead.
+
+The bytecode executor compiles the template once into a flat instruction
+stream: all static HTML (tags, attrs, text, escaping) is coalesced into a
+single output buffer at compile time — exactly what templ's compiler does —
+so a static-heavy template renders as one write. It is **16× faster than
+templ** on the same document (85 ns vs 1.4 µs) because templ still writes
+piece-by-piece while we merge the whole static region.
 
 ### Cache latency savings (p50/p99/p99.9, 20k samples)
 

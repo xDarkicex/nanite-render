@@ -35,6 +35,12 @@ type Program struct {
 	// the type.
 	EngineData any
 
+	// Bytecode is the flat instruction stream compiled from Nodes
+	// (see CompileBytecode). When present, Execute runs it instead of
+	// the recursive tree walk — static HTML renders as coalesced
+	// writes, matching templ's compile-to-output speed.
+	Bytecode *Bytecode
+
 	// engine-private scratch
 	scratch []byte
 }
