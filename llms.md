@@ -317,6 +317,50 @@ Components WITHOUT a boundary keep the existing fast path — no
 registered. For development-time loud failures, omit the
 boundary and let the panic propagate.
 
+### 6.3 Cascading Context (zero-alloc)
+
+Prop-drilling theme/user/locale through 15 layers is painful.
+`ProvideContext` + `UseContext` solves it with zero heap
+allocations:
+
+```go
+cr.Define("LAYOUT").
+    Render(func(c *render.ComponentContext) error {
+        c.ProvideContext("theme", "dark")
+        return c.RenderChildren(/* ... */)
+    })
+
+cr.Define("DEEP_BUTTON").
+    Render(func(c *render.ComponentContext) error {
+        theme := c.UseContext("theme").(string)
+        return c.WriteString(`<button class="` + theme + `">...</button>`)
+    })
+```
+
+Mechanics: a fixed-size `[16]contextKV` array lives directly
+on `*RenderContext`. Pushes are pure memory moves (zero alloc).
+Lookup scans the stack backwards (newest first) so inner
+bindings shadow outer ones.
+
+Scope isolation: the dispatcher pops the stack back to the
+saved depth when each component's render returns. Bindings
+made inside `LAYOUT.Render` are visible to `DEEP_BUTTON`
+(nested) but NOT to a sibling rendered after `LAYOUT`
+finishes.
+
+Templates: `render.UseContextFunc(rc)` returns a FuncMap
+helper. Pass it via `render.WithFuncMap(...)` and templates
+can call `{{ useContext "theme" }}` — same stack, same
+lookup, zero allocations.
+
+Hard cap at `render.MaxContextDepth` (16). Overflow panics —
+it's a programming bug, not a runtime condition.
+
+Async workers run against a fresh `*RenderContext` (empty
+stack). They don't inherit cascading state from the inline
+render — pass what the worker needs via props or set it in
+the `Fallback`.
+
 ---
 
 ## 7. Sharp edges

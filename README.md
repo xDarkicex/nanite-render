@@ -499,6 +499,7 @@ Every engine gets the framework's cross-cutting superpowers automatically:
 | `get` / `set` | `{{ get "count" }}` / `{{ set "count" 5 }}` | State access |
 | `<SLOW_DATA/>` with `Async()` + `Fallback()` | Server-side Suspense — fallback hits the wire immediately, real output streams as an HTMX OOB chunk when the worker finishes | Turns `Sum(component_times)` into `Max(component_times)` |
 | `ErrorBoundary(fn)` on a `Definition` | Isolates panics in the component's render — boundary runs against a fresh context, the failed component's bytes are discarded, the rest of the page continues | One broken widget never kills the whole request |
+| `ProvideContext(key, val)` / `UseContext(key)` on `ComponentContext` | Push/pop a value onto a fixed-size stack on the request context; reverse-scan lookup; auto-pop on scope exit; zero heap allocations | Cascading state without prop-drilling, with template-engine reach via `useContext` |
 
 The `component` and `yield` superpowers are injected into the FuncMap of any engine that compiles via html/template (jade, html-template). The plain HTML engine uses the SoA executor's native `<COMPONENT/>` dispatch instead.
 
@@ -655,6 +656,37 @@ cr.Define("DASHBOARD_WIDGET").
 **Nested safety:** the boundary call is itself wrapped in `defer/recover`. If the boundary panics or returns an error, the generic placeholder is emitted and rendering continues.
 
 **Without a boundary:** a panic re-panics out of the component (sync) or silently drops the OOB chunk (async). Use boundaries when you want graceful degradation; rely on re-panic when you want loud failures during development.
+
+---
+
+## Cascading Context (React-style, zero-alloc)
+
+Prop-drilling theme/user/locale/CSRF-token through 15 layers is painful. `ProvideContext` + `UseContext` solves it without heap allocations:
+
+```go
+cr.Define("LAYOUT").
+    Render(func(c *render.ComponentContext) error {
+        c.ProvideContext("theme", "dark")
+        c.ProvideContext("user", currentUser)
+        return c.RenderChildren(/* ... */)
+    })
+
+cr.Define("DEEP_BUTTON").
+    Render(func(c *render.ComponentContext) error {
+        theme := c.UseContext("theme").(string)  // "dark"
+        return c.WriteString(`<button class="` + theme + `">...</button>`)
+    })
+```
+
+**How it works:** a fixed-size `[16]contextKV` array lives directly on `*RenderContext`. `PushContext` is a pure memory move (zero alloc). `GetContext` scans the stack backwards (newest first), so inner bindings shadow outer ones — true cascading scope.
+
+**Scope isolation:** the dispatcher pops the stack back to the saved depth when each component's render returns. Bindings made inside `LAYOUT.Render` are visible to `DEEP_BUTTON` (nested), but NOT to a sibling component rendered after `LAYOUT` finishes.
+
+**Templates too:** pass `render.UseContextFunc(rc)` into your FuncMap and templates can call `{{ useContext "theme" }}` directly — the same stack, zero allocations, type-asserted in the template.
+
+**Hard cap:** the stack overflows at 16 nested bindings (`render.MaxContextDepth`). That's a programming bug, not a runtime condition — the render panics with a clear message. If you need more, prefer explicit prop passing.
+
+**Async workers** get a fresh `*RenderContext` (their own empty stack), so they don't inherit cascading state from the inline render. Provide what the worker needs in its `Fallback` or pass via props.
 
 ---
 

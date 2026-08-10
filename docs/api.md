@@ -536,6 +536,50 @@ safe to log; do not echo it into the response without scrubbing.
 
 ---
 
+## Cascading Context
+
+```go
+// RenderContext (low-level):
+func (rc *RenderContext) PushContext(key string, val any)
+func (rc *RenderContext) PopContextTo(savedPtr int)
+func (rc *RenderContext) GetContext(key string) any
+func (rc *RenderContext) ContextDepth() int
+
+// ComponentContext (ergonomic wrappers — auto-pop on scope exit):
+func (c *ComponentContext) ProvideContext(key string, val any)
+func (c *ComponentContext) UseContext(key string) any
+
+// Template bridge:
+func UseContextFunc(rc *RenderContext) any  // returns the useContext func
+
+const MaxContextDepth = 16  // hard cap; overflow panics
+```
+
+A fixed-size `[16]contextKV` array lives on `*RenderContext`.
+Pushes are pure memory moves (zero alloc). Lookup scans the
+stack backwards (newest first) so inner bindings shadow outer
+ones — true cascading scope.
+
+Scope isolation: the dispatcher pops the stack back to the
+saved depth when each component's render returns. Bindings
+made inside one component do NOT leak into siblings or
+parents.
+
+Template engine bridge: register `render.UseContextFunc(rc)`
+in your FuncMap and templates can call `{{ useContext "theme" }}`
+directly. Zero allocations, same stack as the fluent API.
+
+Overflow: `MaxContextDepth` pushes panic. That's a programming
+bug, not a runtime condition — if you need more than 16 nested
+bindings, prefer explicit prop passing.
+
+Async workers run against their own fresh `*RenderContext`
+(empty stack). They don't inherit cascading state from the
+inline render — pass what the worker needs via props or set
+it in the `Fallback`.
+
+---
+
 ## SoA NodeStream
 
 ### `NodeStream`

@@ -137,7 +137,44 @@ type RenderContext struct {
 	// a render walk; see suspense.go.
 	suspense     *suspenseCoordinator
 	suspenseOnce sync.Once
+
+	// ctxStack is the cascading-context stack. Components call
+	// ProvideContext to push (key, val) and UseContext to look up
+	// the nearest binding for a key (reverse-scan). The stack is
+	// hard-capped at MaxContextDepth to keep everything on the
+	// RenderContext itself — no heap slices, no maps, zero
+	// allocations on the hot path.
+	//
+	// RenderContext is pool-allocated so this fixed-size array is
+	// persistent across AcquireContext/ReleaseContext. The
+	// stack pointer is reset in AcquireContext; per-render
+	// pushes during the walk are unwound automatically by
+	// ComponentContext when each component's render returns.
+	ctxStack [MaxContextDepth]contextKV
+	ctxPtr   int
 }
+
+// contextKV is one slot on the cascading-context stack. Stored
+// inline in RenderContext so pushes/pops are pure memory moves
+// (no allocation).
+type contextKV struct {
+	key string
+	val any
+}
+
+// MaxContextDepth is the hard cap on nested context bindings per
+// request. 16 is enough for any realistic UI — if you need more,
+// you probably want explicit prop passing instead.
+const MaxContextDepth = 16
+
+// errContextOverflow is returned (as a panic from ProvideContext)
+// when the stack exceeds MaxContextDepth. Components don't recover
+// from this — it's a programming error, not a runtime condition.
+var errContextOverflow = &contextError{msg: "render: context stack overflow (>16 nested ProvideContext calls)"}
+
+type contextError struct{ msg string }
+
+func (e *contextError) Error() string { return e.msg }
 
 // HTMXResponse bundles server-driven HTMX response decisions. The
 // router calls one method on RenderContext (e.g. SetHXRetarget) per
@@ -230,6 +267,104 @@ func (rc *RenderContext) SetVariant(dim, value string) {
 	rc.Variants[dim] = value
 }
 
+// PushContext pushes (key, val) onto the cascading-context stack.
+// Nested bindings shadow outer ones (reverse-scan lookup). The
+// stack is hard-capped at MaxContextDepth; pushing beyond that
+// panics — it's a programming error, not a runtime condition.
+//
+// RenderContext pooling keeps the array persistent across
+// requests, so each Push is a pure memory move (no allocation).
+//
+// Prefer ComponentContext.ProvideContext over calling this
+// directly — it auto-pops on the component's render scope exit
+// and gives you true cascading isolation.
+func (rc *RenderContext) PushContext(key string, val any) {
+	if rc == nil {
+		return
+	}
+	if rc.ctxPtr >= len(rc.ctxStack) {
+		panic(errContextOverflow)
+	}
+	rc.ctxStack[rc.ctxPtr] = contextKV{key: key, val: val}
+	rc.ctxPtr++
+}
+
+// PopContextTo sets the stack pointer back to a saved index.
+// Used by ComponentContext to unwind pushes made during its
+// render frame so bindings don't leak out of scope.
+func (rc *RenderContext) PopContextTo(savedPtr int) {
+	if rc == nil {
+		return
+	}
+	// Defensive: never let the pointer go negative or above the
+	// current depth.
+	if savedPtr < 0 {
+		savedPtr = 0
+	}
+	if savedPtr > rc.ctxPtr {
+		savedPtr = rc.ctxPtr
+	}
+	// Clear the popped slots so GC can collect val if it holds
+	// the only reference. Without this, popped vals would stay
+	// reachable via the stack slot until the next push overwrites
+	// them.
+	for i := savedPtr; i < rc.ctxPtr; i++ {
+		rc.ctxStack[i] = contextKV{}
+	}
+	rc.ctxPtr = savedPtr
+}
+
+// GetContext scans the cascading-context stack backwards (newest
+// first) and returns the value bound to the nearest matching
+// key, or nil if no binding exists. Returns nil for a nil
+// receiver.
+//
+// O(n) in the stack depth — at MaxContextDepth=16 the loop is
+// fully unrolled and fits in a single cache line.
+func (rc *RenderContext) GetContext(key string) any {
+	if rc == nil {
+		return nil
+	}
+	for i := rc.ctxPtr - 1; i >= 0; i-- {
+		if rc.ctxStack[i].key == key {
+			return rc.ctxStack[i].val
+		}
+	}
+	return nil
+}
+
+// ContextDepth returns the current stack depth. Useful for
+// instrumentation / debugging; not used in the hot path.
+func (rc *RenderContext) ContextDepth() int {
+	if rc == nil {
+		return 0
+	}
+	return rc.ctxPtr
+}
+
+// UseContextFunc returns a template.FuncMap entry that resolves
+// the cascading-context stack. Register it via WithFuncMap so
+// templates can call {{ useContext "theme" }} and get the nearest
+// binding. The result is `any` — the template type-asserts.
+//
+// Usage:
+//
+//	reg := render.New(render.WithFuncMap(render.UseContextFunc))
+//	// or merge into your own builder:
+//	fm := template.FuncMap{"useContext": render.UseContextFunc}
+//
+// Templates that don't go through the per-request FuncMap won't
+// see this helper — but fluent components use ComponentContext
+// directly.
+func UseContextFunc(rc *RenderContext) any {
+	return func(key string) any {
+		if rc == nil {
+			return nil
+		}
+		return rc.GetContext(key)
+	}
+}
+
 // Context pool. One instance per request, returned to the pool on defer.
 var rcPool = sync.Pool{
 	New: func() any { return &RenderContext{} },
@@ -265,6 +400,13 @@ func AcquireContext(w ByteWriter, req *http.Request) *RenderContext {
 	rc.hmx = HTMXResponse{}
 	rc.suspense = nil
 	rc.suspenseOnce = sync.Once{}
+	// Reset the cascading-context stack pointer. The array
+	// contents are not cleared here because any leftover binding
+	// is unreachable (ctxPtr is the live boundary) and will be
+	// overwritten by the next push. ComponentContext's auto-pop
+	// clears its own scope on exit, so per-render leakage is
+	// impossible.
+	rc.ctxPtr = 0
 	if rc.state == nil {
 		rc.state = NewState()
 	} else {
@@ -296,6 +438,7 @@ func ReleaseContext(rc *RenderContext) {
 	rc.hmx = HTMXResponse{}
 	rc.suspense = nil
 	rc.suspenseOnce = sync.Once{}
+	rc.ctxPtr = 0
 	rcPool.Put(rc)
 }
 

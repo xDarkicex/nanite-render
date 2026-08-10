@@ -44,6 +44,14 @@ type ComponentContext struct {
 	// wrapper checks this after the user's render returns; if true,
 	// it emits the OOB swap.
 	dirty bool
+
+	// savedCtxPtr is the RenderContext's context-stack depth at
+	// the moment this ComponentContext was created. The dispatch
+	// path (fluentComponent.Render and friends) pops the stack
+	// back to this depth after the user's render returns, so
+	// ProvideContext bindings made during this component's scope
+	// don't leak out into siblings or parents.
+	savedCtxPtr int
 }
 
 // Write writes a byte slice to the output. Convenience over Writer.
@@ -118,6 +126,43 @@ func (c *ComponentContext) UseState(key string, initial any) (any, func(any)) {
 			c.dirty = true
 		}
 	}
+}
+
+// ProvideContext pushes (key, val) onto the cascading-context
+// stack. The binding is visible to this component and every
+// component it renders (children, sub-children, …) until the
+// component's render scope exits — the dispatcher automatically
+// pops the stack back to savedCtxPtr on return, so bindings
+// don't leak into siblings or parent frames.
+//
+// Shadowing: an inner ProvideContext("theme", "light") overrides
+// an outer binding for the duration of the inner component's
+// scope. Lookup is reverse-scan (newest first), so the nearest
+// binding wins.
+//
+// Panics if the stack overflows MaxContextDepth — that's a
+// programming bug, not a runtime condition.
+//
+// Nil-safe: a nil receiver is a no-op.
+func (c *ComponentContext) ProvideContext(key string, val any) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.PushContext(key, val)
+}
+
+// UseContext returns the value bound to the nearest matching key
+// in the cascading-context stack, or nil if no binding exists.
+// The caller type-asserts the result:
+//
+//	theme := c.UseContext("theme").(string)
+//
+// Nil-safe for the receiver.
+func (c *ComponentContext) UseContext(key string) any {
+	if c == nil || c.Context == nil {
+		return nil
+	}
+	return c.Context.GetContext(key)
 }
 
 // Render dispatches a named, registered component inline, writing to
@@ -517,6 +562,11 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 	// overhead. This is the common case.
 	if f.errBoundary == nil && f.oobID == "" {
 		ctx := f.buildCtx(w, rc, data, "")
+		// Auto-pop any cascading-context pushes the user's render
+		// made, so bindings don't leak into sibling/parent frames.
+		if rc != nil {
+			defer rc.PopContextTo(ctx.savedCtxPtr)
+		}
 		return f.fn(ctx)
 	}
 
@@ -529,6 +579,12 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 	bw := AcquireWriter(buf)
 	defer ReleaseWriter(bw)
 	ctx := f.buildCtx(bw, rc, data, f.oobID)
+	// Auto-pop any cascading-context pushes from this render.
+	// Goes AFTER buildCtx so we have the saved pointer, but the
+	// defer fires at function exit regardless of panic.
+	if rc != nil {
+		defer rc.PopContextTo(ctx.savedCtxPtr)
+	}
 
 	var renderErr error
 	if f.errBoundary != nil {
@@ -614,27 +670,36 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 
 // buildCtx constructs the ComponentContext for a render. oobID is
 // passed through to the context so SetState/UseState can flag the
-// frame dirty during execution.
+// frame dirty during execution. savedCtxPtr captures the
+// cascading-context stack depth at this moment so the dispatch
+// path can unwind any pushes made via ProvideContext during the
+// component's render scope.
 func (f *fluentComponent) buildCtx(w ByteWriter, rc *RenderContext, data any, oobID string) *ComponentContext {
+	var ptr int
+	if rc != nil {
+		ptr = rc.ctxPtr
+	}
 	if f.withChildren {
 		return &ComponentContext{
-			Writer:   w,
-			Context:  rc,
-			Data:     data,
-			Children: extractChildren(data),
-			Slots:    extractSlots(data),
-			State:    getCompState(rc),
-			DataMap:  asMap(data),
-			oobID:    oobID,
+			Writer:      w,
+			Context:     rc,
+			Data:        data,
+			Children:    extractChildren(data),
+			Slots:       extractSlots(data),
+			State:       getCompState(rc),
+			DataMap:     asMap(data),
+			oobID:       oobID,
+			savedCtxPtr: ptr,
 		}
 	}
 	return &ComponentContext{
-		Writer:  w,
-		Context: rc,
-		Data:    data,
-		State:   getCompState(rc),
-		DataMap: asMap(data),
-		oobID:   oobID,
+		Writer:      w,
+		Context:     rc,
+		Data:        data,
+		State:       getCompState(rc),
+		DataMap:     asMap(data),
+		oobID:       oobID,
+		savedCtxPtr: ptr,
 	}
 }
 
