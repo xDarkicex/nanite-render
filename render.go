@@ -137,10 +137,21 @@ type Registry struct {
 	// RenderContext has no per-request loader. Set via
 	// WithDefaultLoader. Lock-free read via atomic.Pointer.
 	defaultLoader atomic.Pointer[SourceFunc]
+
+	// preloads: registry-level <link rel="preload"> hints. The
+	// <PRELOADS/> component tag emits these inside the layout's
+	// <head>, so the browser fetches CSS / JS / images in parallel
+	// with the shell's render. Lock-free read via atomic.Pointer;
+	// writes are copy-on-write CAS.
+	preloads atomic.Pointer[[]PreloadHint]
 }
 
 // NewRegistry returns a Registry with the given engines. The first
 // engine is the default for unqualified Render calls.
+//
+// The PRELOADS component is registered automatically. It emits the
+// registry-level preload hints as <link rel="preload"> tags when
+// referenced in a layout (typically inside <head>).
 func NewRegistry(engines ...Engine) *Registry {
 	r := &Registry{}
 	empty := []Engine{}
@@ -154,6 +165,11 @@ func NewRegistry(engines ...Engine) *Registry {
 	for _, e := range engines {
 		r.AddEngine(e)
 	}
+	// Register PRELOADS as a built-in component backed by this
+	// registry. Users may override via AttachComponents if they
+	// want custom emission.
+	r.components.Store(NewComponentRegistry())
+	r.components.Load().Register("PRELOADS", &preloadsComponent{r: r})
 	return r
 }
 
@@ -342,6 +358,15 @@ func (r *Registry) renderNamed(rc *RenderContext, engine, name string, data any)
 	r.InjectFuncMap(rc, data)
 	if d := rc.UserData(); d != nil {
 		data = d
+	}
+	// Auto-populate the per-request ComponentRegistry from the
+	// registry's built-ins (e.g. PRELOADS) when the caller hasn't
+	// already attached one. Users who call AttachComponents with
+	// their own registry override this.
+	if rc.ComponentRegistry() == nil {
+		if cr := r.Components(); cr != nil {
+			rc.SetComponentRegistry(cr)
+		}
 	}
 	p, err := r.loadPart(eng, engine, name, rc)
 	if err != nil {
@@ -657,4 +682,36 @@ func (r *Registry) InvalidateTag(tag string) int {
 		}
 	}
 	return n
+}
+
+// RenderComponent dispatches a named, registered component directly
+// to w, bypassing any parent template or layout. This is the entry
+// point for HTMX-style targeted swaps: a handler receives an
+// `hx-get="/posts/123/card"` request and renders JUST the CARD
+// component without re-rendering the surrounding page.
+//
+// The component is resolved via the registry's ComponentRegistry
+// (the same path the html/template `{{ component "Name" . }}`
+// superpower uses). The lookup follows rc.ComponentRegistry() first
+// (so per-request attachment via SetComponentRegistry wins), then
+// the registry's built-in components.
+//
+// Returns nil (no error) when the name is not registered — the same
+// semantics as the html/template superpower. Missing components are
+// not a render error; they are a configuration gap the caller may
+// or may not care about.
+func (r *Registry) RenderComponent(w ByteWriter, rc *RenderContext, name string, props any) error {
+	cr := rc.ComponentRegistry()
+	if cr == nil {
+		cr = r.Components()
+		if cr == nil {
+			return nil
+		}
+		rc.SetComponentRegistry(cr)
+	}
+	c, ok := cr.Lookup(name)
+	if !ok {
+		return nil
+	}
+	return renderComponent(c, w, rc, props, nil)
 }

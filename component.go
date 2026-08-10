@@ -215,6 +215,24 @@ func dispatchComponent(w ByteWriter, rc *RenderContext, name string, props any) 
 	return renderComponent(c, w, rc, props, nil)
 }
 
+// OOBOptioner is an optional interface a Component implements to
+// participate in HTMX-style Out-of-Band swaps. Components that opt
+// in via OOBID() have their rendered output wrapped in
+//
+//	<div id="<oob-id>" hx-swap-oob="true">...</div>
+//
+// when their render mutates state via SetState / UseState. The id is
+// a hard DOM contract — it must match the `id` attribute of the
+// element the swap replaces.
+//
+// Engines that pre-compile components (templ, html/template) can
+// implement OOBOptioner directly without using the fluent builder.
+// The fluent builder exposes this via Definition.WithOOB(id).
+type OOBOptioner interface {
+	Component
+	OOBID() string
+}
+
 // RenderComponent renders a named, registered component inline,
 // writing to w. It recovers the *RenderContext from ctx (see
 // WithContext), so a templ component can compose a nanite-render

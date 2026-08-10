@@ -1,7 +1,11 @@
 package render
 
 import (
+	"bytes"
+	"html"
 	"html/template"
+	"strings"
+	"sync"
 )
 
 // ComponentContext bundles all the render arguments into a single
@@ -27,6 +31,18 @@ type ComponentContext struct {
 	// DataMap is the data map (may be nil). The component can
 	// read/modify it for child propagation.
 	DataMap map[string]any
+
+	// oobID is the OOB target ID when this component was declared
+	// with WithOOB(). Empty for normal components. When set, the
+	// render wrapper buffers the component's bytes and emits them
+	// wrapped in <div id="oobID" hx-swap-oob="true">...</div> if
+	// any SetState/UseState mutation occurred during this render.
+	oobID string
+
+	// dirty is set by SetState when oobID is non-empty. The render
+	// wrapper checks this after the user's render returns; if true,
+	// it emits the OOB swap.
+	dirty bool
 }
 
 // Write writes a byte slice to the output. Convenience over Writer.
@@ -69,12 +85,17 @@ func (c *ComponentContext) GetState(key string) (any, bool) {
 	return c.State.Get(key)
 }
 
-// SetState writes a value to the per-render state.
+// SetState writes a value to the per-render state. When this context
+// is bound to a component declared with WithOOB, SetState also marks
+// the frame dirty so the render wrapper emits an HTMX OOB swap.
 func (c *ComponentContext) SetState(key string, v any) {
 	if c == nil || c.State == nil {
 		return
 	}
 	c.State.Set(key, v)
+	if c.oobID != "" {
+		c.dirty = true
+	}
 }
 
 // UseState is the React-style hook. It returns the current value for
@@ -82,11 +103,20 @@ func (c *ComponentContext) SetState(key string, v any) {
 // affects subsequent renders; the current render keeps its value.
 //
 // For a typed variant use render.UseState[T](c.State, key, initial).
+//
+// When this context is bound to a component declared with WithOOB,
+// the setter also marks the frame dirty so the render wrapper emits
+// an HTMX OOB swap.
 func (c *ComponentContext) UseState(key string, initial any) (any, func(any)) {
 	if c == nil || c.State == nil {
 		return initial, func(any) {}
 	}
-	return c.State.UseState(key, initial), func(v any) { c.State.Set(key, v) }
+	return c.State.UseState(key, initial), func(v any) {
+		c.State.Set(key, v)
+		if c.oobID != "" {
+			c.dirty = true
+		}
+	}
 }
 
 // Render dispatches a named, registered component inline, writing to
@@ -96,6 +126,43 @@ func (c *ComponentContext) UseState(key string, initial any) (any, func(any)) {
 // component on any engine.
 func (c *ComponentContext) Render(name string, props any) error {
 	return dispatchComponent(c.Writer, c.Context, name, props)
+}
+
+// AddHXTrigger records an HTMX client-side event to fire after this
+// render completes. Convenience over RenderContext.AddHXTrigger for
+// component authors. Safe to call with nil receiver.
+func (c *ComponentContext) AddHXTrigger(name string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.AddHXTrigger(name)
+}
+
+// AddHXTriggerWithDetail records an event with a JSON-encodable
+// detail payload. Convenience over RenderContext.AddHXTriggerWithDetail.
+func (c *ComponentContext) AddHXTriggerWithDetail(name string, detail any) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.AddHXTriggerWithDetail(name, detail)
+}
+
+// AddHXTriggerAfterSwap records an HTMX event to fire after the swap
+// step. Convenience over RenderContext.AddHXTriggerAfterSwap.
+func (c *ComponentContext) AddHXTriggerAfterSwap(name string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.AddHXTriggerAfterSwap(name)
+}
+
+// AddHXTriggerAfterSettle records an HTMX event to fire after the
+// settle step. Convenience over RenderContext.AddHXTriggerAfterSettle.
+func (c *ComponentContext) AddHXTriggerAfterSettle(name string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.AddHXTriggerAfterSettle(name)
 }
 
 // Props binds c.Data to a typed struct via nanite:"key" tags.
@@ -134,6 +201,7 @@ type Definition struct {
 	funcs        template.FuncMap
 	render       ComponentRenderFunc
 	withChildren bool
+	oobID        string
 }
 
 // WithFuncs declares the per-component FuncMap. The FuncMap is
@@ -163,6 +231,28 @@ func (d *Definition) RenderChildren(fn ComponentRenderFunc) *Definition {
 	return d
 }
 
+// WithOOB enables HTMX Out-of-Band swap emission for this component.
+// targetID is the DOM `id` of the element the swap replaces — it
+// must match an `id` attribute in the page. The id is required and
+// is a hard contract: HTMX selectors are case-sensitive and a
+// mismatch silently breaks the swap.
+//
+// When the component mutates state via SetState / UseState during
+// its render, its output is wrapped in
+//
+//	<div id="<targetID>" hx-swap-oob="true">...</div>
+//
+// and written to rc.OOBSink() (which falls back to rc.Writer when no
+// explicit sink is configured). When the component does NOT mutate
+// state, its bytes are written to the original writer unchanged.
+//
+// WithOOB is strictly opt-in — components without it render exactly
+// as before, with no buffer copy or wrapper overhead.
+func (d *Definition) WithOOB(targetID string) *Definition {
+	d.oobID = targetID
+	return d
+}
+
 // Register finalises the definition and registers it with the
 // ComponentRegistry.
 func (d *Definition) Register(cr *ComponentRegistry) {
@@ -175,8 +265,36 @@ func (d *Definition) Register(cr *ComponentRegistry) {
 		fn:           d.render,
 		funcs:        d.funcs,
 		withChildren: d.withChildren,
+		oobID:        d.oobID,
 	}
 	cr.Register(d.name, c)
+}
+
+// oobBufPool is a sync.Pool of *bytes.Buffer used by OOB-enabled
+// components to capture their rendered bytes before deciding whether
+// to wrap them in an HTMX OOB swap. Pooled so the steady-state
+// allocation count stays at zero.
+var oobBufPool = sync.Pool{
+	New: func() any {
+		return &bytes.Buffer{}
+	},
+}
+
+// acquireOOBBuffer returns a clean buffer from the pool.
+func acquireOOBBuffer() *bytes.Buffer {
+	b := oobBufPool.Get().(*bytes.Buffer)
+	b.Reset()
+	return b
+}
+
+// releaseOOBBuffer returns buf to the pool. Safe to call multiple
+// times (Reset first).
+func releaseOOBBuffer(buf *bytes.Buffer) {
+	if buf == nil {
+		return
+	}
+	buf.Reset()
+	oobBufPool.Put(buf)
 }
 
 // fluentComponent adapts a ComponentRenderFunc to the Component
@@ -187,13 +305,28 @@ type fluentComponent struct {
 	fn           ComponentRenderFunc
 	funcs        template.FuncMap
 	withChildren bool
+	oobID        string
 }
+
+// OOBID implements OOBOptioner. Returns the target DOM element id
+// when the component was declared with WithOOB(), or "" otherwise.
+func (f *fluentComponent) OOBID() string { return f.oobID }
 
 // Render implements Component. It builds the ComponentContext from
 // the render arguments and delegates to the user's function. It is
 // nil-safe for rc: superpower dispatches (e.g. componentSuperpower)
 // pass nil rc, so the fluent component tolerates a nil context and
 // only sets state/slots when rc is present.
+//
+// When the component has oobID set, the user's render writes to a
+// pooled buffer; after the user's render returns, the wrapper emits
+// the buffered bytes either:
+//   - to rc.OOBSink() wrapped in <div id="oobID" hx-swap-oob="true">
+//     when ctx.dirty was set by SetState/UseState during the render, or
+//   - to the original writer unchanged when no state was mutated.
+//
+// The buffer is released to the pool via defer, so even a panic in
+// the user's render returns the buffer cleanly.
 func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) error {
 	// Set the per-component FuncMap if the fluent component
 	// declared one. Nil-safe for rc.
@@ -205,28 +338,93 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 		defer func() { rc.ComponentFuncMap = prev }()
 	}
 
+	// Fast path: no OOB → render directly to the original writer.
+	if f.oobID == "" {
+		ctx := f.buildCtx(w, rc, data, "")
+		return f.fn(ctx)
+	}
+
+	// OOB path: render to a pooled buffer, then decide whether to
+	// wrap based on whether SetState was called during the render.
+	buf := acquireOOBBuffer()
+	defer releaseOOBBuffer(buf)
+	bw := AcquireWriter(buf)
+	defer ReleaseWriter(bw)
+
+	ctx := f.buildCtx(bw, rc, data, f.oobID)
+	if err := f.fn(ctx); err != nil {
+		return err
+	}
+	// Drain the wrapper buffer so its bytes are visible.
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+
+	// Clean render — write directly to the original writer without
+	// the OOB wrapper. This is the common case for an OOB-enabled
+	// component that didn't actually mutate state this round.
+	if !ctx.dirty {
+		_, err := w.Write(buf.Bytes())
+		return err
+	}
+
+	// Dirty render — wrap in <div id="..." hx-swap-oob="true"> and
+	// emit to the OOB sink. Attribute values are escaped so a
+	// malicious oobID can't break out of the attribute.
+	sink := w
+	if rc != nil {
+		sink = rc.OOBSink()
+		if sink == nil {
+			sink = w
+		}
+	}
+	// Auto-emit an HX-Trigger event so the client knows this
+	// component was updated. The event name is the lowercased
+	// component name; users can call AddHXTrigger explicitly to
+	// add more events (dedup keeps the set small).
+	if rc != nil {
+		rc.AddHXTrigger(strings.ToLower(f.name))
+	}
+	if _, err := sink.WriteString(`<div id="`); err != nil {
+		return err
+	}
+	if _, err := sink.WriteString(html.EscapeString(f.oobID)); err != nil {
+		return err
+	}
+	if _, err := sink.WriteString(`" hx-swap-oob="true">`); err != nil {
+		return err
+	}
+	if _, err := sink.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	_, err := sink.WriteString(`</div>`)
+	return err
+}
+
+// buildCtx constructs the ComponentContext for a render. oobID is
+// passed through to the context so SetState/UseState can flag the
+// frame dirty during execution.
+func (f *fluentComponent) buildCtx(w ByteWriter, rc *RenderContext, data any, oobID string) *ComponentContext {
 	if f.withChildren {
-		children := extractChildren(data)
-		slots := extractSlots(data)
-		ctx := &ComponentContext{
+		return &ComponentContext{
 			Writer:   w,
 			Context:  rc,
 			Data:     data,
-			Children: children,
-			Slots:    slots,
+			Children: extractChildren(data),
+			Slots:    extractSlots(data),
 			State:    getCompState(rc),
 			DataMap:  asMap(data),
+			oobID:    oobID,
 		}
-		return f.fn(ctx)
 	}
-	ctx := &ComponentContext{
-		Writer:   w,
-		Context:  rc,
-		Data:     data,
-		State:    getCompState(rc),
-		DataMap:  asMap(data),
+	return &ComponentContext{
+		Writer:  w,
+		Context: rc,
+		Data:    data,
+		State:   getCompState(rc),
+		DataMap: asMap(data),
+		oobID:   oobID,
 	}
-	return f.fn(ctx)
 }
 
 // getCompState returns rc.ComponentState(), or nil if rc is nil.
