@@ -84,6 +84,13 @@ func WithDefaultLoader(loader SourceFunc) Option {
 	return func(r *Registry) { r.SetDefaultLoader(loader) }
 }
 
+// WithActionPrefix changes the URL prefix for colocated server
+// actions (default "/_nano/action/"). The prefix must end with
+// "/" — ActionURL appends {COMPONENT}/{action} directly.
+func WithActionPrefix(prefix string) Option {
+	return func(r *Registry) { r.SetActionPrefix(prefix) }
+}
+
 // Chainable aliases for fluent builder.
 
 // WithEngine (alias) is exposed via Registry.WithEngine below.

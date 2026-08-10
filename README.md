@@ -391,6 +391,7 @@ nanite-render gives you a React-flavoured composition model in Go — components
 | `<Suspense>` / `fallback` | [`cr.Define(...).Async().Fallback(fn)`](#server-side-suspense-async--fallback) — server-side, streams via HTMX OOB |
 | `React.memo` | [`cr.Memoize(name, keyer)`](#per-component-memoization) |
 | `createPortal` (render elsewhere) | [`WithOOB(id)`](#out-of-band-swaps-hx-swap-oobtrue) — HTMX out-of-band swaps |
+| Server Actions (`"use server"`) | [`cr.Define(...).Action(name, fn)`](#colocated-server-actions-nextjs-server-actions-style) — colocated mutations, universal handler, secure by default |
 | Inline composition (`<Navbar/>`) | [`c.Render("Navbar", props)`](#the-fluent-builder) |
 
 The same component runs identically from **templ**, **html/template**, **jade**, and **plain HTML** — the React layer is engine-agnostic.
@@ -721,6 +722,48 @@ cr.Define("DEEP_BUTTON").
 **Templates too:** the default FuncMap already includes `useState`, `get`, `set`, and `useContext` — batteries included. Templates call `{{ useContext "theme" }}` directly, no opt-in.
 
 **Async workers** get a fresh `*RenderContext` (their own empty stack), so they don't inherit cascading state from the inline render. Provide what the worker needs in its `Fallback` or pass via props.
+
+---
+
+## Colocated Server Actions (Next.js `server actions` style)
+
+Mutation logic lives right next to the component that triggers it. The component declares its own HTTP handlers; one universal handler dispatches them on any router.
+
+```go
+cr.Define("LIKE_BUTTON").
+    Action("toggle", func(rc *render.RenderContext, props map[string]any) error {
+        db.Exec("UPDATE likes ...") // user's own storage
+        return nil
+    }).
+    Render(func(c *render.ComponentContext) error {
+        liked := queryLikes()
+        // c.ActionURL auto-generates: /_nano/action/LIKE_BUTTON/toggle
+        return c.WriteString(`<button hx-post="` + c.ActionURL("toggle") + `">` +
+            strings.Repeat("❤", liked) + `</button>`)
+    }).
+    Register(cr)
+```
+
+Mount one handler on any router:
+
+```go
+// chi
+r.Post("/_nano/action/*", reg.HandleAction)
+// stdlib
+mux.HandleFunc("/_nano/action/", reg.HandleAction)
+```
+
+**The flow** when the action URL is POSTed:
+
+1. **Security baseline (secure by default):** method must be POST, `HX-Request` must be `true`, and the `Origin`/`Referer` host must match the request `Host` — a CSRF baseline that requires zero setup. All checks fail with 403.
+2. **Dispatch:** the path is parsed as `{prefix}/{COMPONENT}/{action}`; unknown component or action → 404.
+3. **Props:** the body is parsed — JSON (`application/json`) decodes into a `map[string]any` with real types (`BindProps`-compatible); form bodies get best-effort conversion (`"42"` → `int`, `"true"` → `bool`, `"3.14"` → `float64`, else string).
+4. **Mutate:** the action closure runs with a fresh `RenderContext`. `HX-Trigger` events it records are emitted on the response.
+5. **Re-render:** the component re-renders with the post-action state. `WithOOB(id)` components get their output wrapped in an HTMX OOB chunk; otherwise raw HTML is returned for the client's `hx-target` to swap inline.
+
+**The state contract (important):** the framework does **not** persist state across requests — that's the user's job (DB, session, cookie). The action mutates storage; the re-render is a pure function of (props, request). Per-request state set in the action *is* visible to the re-render in the same request. This is not React memory semantics.
+
+**Configuration:** the URL prefix defaults to `/_nano/action/`; override with `render.WithActionPrefix("/api/act/")`.
 
 ---
 

@@ -161,6 +161,12 @@ type RenderContext struct {
 	inlineCtx   [inlineCtxCap]contextKV
 	overflowCtx []contextKV
 	ctxPtr      int
+
+	// actionPrefix is the colocated-action URL prefix for this
+	// request. Set by the Registry before rendering (renderNamed)
+	// so ComponentContext.ActionURL can generate absolute action
+	// URLs without a global. "" means the default prefix.
+	actionPrefix string
 }
 
 // contextKV is one slot on the cascading-context stack. Stored
@@ -446,6 +452,7 @@ func AcquireContext(w ByteWriter, req *http.Request) *RenderContext {
 	// clears its own scope on exit, so per-render leakage is
 	// impossible.
 	rc.ctxPtr = 0
+	rc.actionPrefix = ""
 	if rc.state == nil {
 		rc.state = NewState()
 	} else {
@@ -478,6 +485,7 @@ func ReleaseContext(rc *RenderContext) {
 	rc.suspense = nil
 	rc.suspenseOnce = sync.Once{}
 	rc.ctxPtr = 0
+	rc.actionPrefix = ""
 	rcPool.Put(rc)
 }
 

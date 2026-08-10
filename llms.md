@@ -439,6 +439,33 @@ the `Fallback`.
   by per-render state.
 - **`state.go`** — per-render `map[string]any` with generic `UseState[T]`.
 - **`props.go`** — `BindProps[T]` struct binding via `nanite:"key"` tags.
+- **`actions.go`** — colocated server actions: `Action()` registry,
+  `HandleAction` universal HTTP handler, CSRF baseline, body parsing.
+
+### 9.1 Colocated Server Actions
+
+Next.js-style colocated mutations. `cr.Define(...).Action("name", fn)`
+registers mutation logic next to the component; `c.ActionURL("name")`
+generates `{prefix}/{COMPONENT}/{name}`; `reg.HandleAction(w, r)` is
+the one universal handler to mount on any router.
+
+Security baseline inside HandleAction (no user setup): POST-only
+(405), `HX-Request: true` required (403), `Origin`/`Referer` host
+must match `Host` (403) — zero-alloc byte scanning, no `net/url`.
+Unknown component/action → 404.
+
+Body → props: JSON keeps real types; form values are best-effort
+converted (`"42"`→int via Atoi, `"true"`→bool, `"3.14"`→float64,
+else string) so `BindProps` exact-type checks work.
+
+Dispatch: action runs with a fresh rc → component re-renders with
+the same rc (action state visible in re-render) → HTMX headers →
+body. `WithOOB(id)` components get OOB-wrapped output; others get
+raw HTML for hx-target inline swap.
+
+CRITICAL contract for generated code / docs: the framework does
+NOT persist state across requests. Actions mutate the user's
+storage; the re-render is a pure function of (props, request).
 
 ---
 

@@ -130,6 +130,13 @@ type Registry struct {
 	// components are registered.
 	components atomic.Pointer[ComponentRegistry]
 
+	// actionPrefix is the URL prefix for colocated server
+	// actions, e.g. "/_nano/action/". Defaults to
+	// DefaultActionPrefix when empty. Written once at setup
+	// (WithActionPrefix / SetActionPrefix) before serving;
+	// read on every HandleAction dispatch.
+	actionPrefix string
+
 	// minify: the active MinifyConfig. nil when minification is off.
 	// Lock-free read via atomic.Pointer.
 	minify atomic.Pointer[MinifyConfig]
@@ -412,6 +419,9 @@ func (r *Registry) renderNamed(rc *RenderContext, engine, name string, data any)
 	if d := rc.UserData(); d != nil {
 		data = d
 	}
+	// Make the action URL prefix visible to components so
+	// c.ActionURL can generate absolute action URLs.
+	rc.actionPrefix = r.ActionPrefix()
 	// Auto-populate the per-request ComponentRegistry from the
 	// registry's built-ins (e.g. PRELOADS) when the caller hasn't
 	// already attached one. Users who call AttachComponents with
@@ -754,6 +764,10 @@ func (r *Registry) InvalidateTag(tag string) int {
 // not a render error; they are a configuration gap the caller may
 // or may not care about.
 func (r *Registry) RenderComponent(w ByteWriter, rc *RenderContext, name string, props any) error {
+	// Make the action URL prefix visible to components so
+	// c.ActionURL works on direct dispatch too (HandleAction's
+	// re-render goes through this path).
+	rc.actionPrefix = r.ActionPrefix()
 	cr := rc.ComponentRegistry()
 	if cr == nil {
 		cr = r.Components()

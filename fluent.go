@@ -52,6 +52,33 @@ type ComponentContext struct {
 	// ProvideContext bindings made during this component's scope
 	// don't leak out into siblings or parents.
 	savedCtxPtr int
+
+	// name is the component's registered name. Used by ActionURL
+	// to build the colocated-action URL.
+	name string
+}
+
+// ActionURL builds the URL for a colocated server action on this
+// component:
+//
+//	{prefix}/{COMPONENT}/{action}
+//
+// e.g. with the default prefix:
+//
+//	c.ActionURL("toggle") // "/_nano/action/LIKE_BUTTON/toggle"
+//
+// The prefix is configurable via WithActionPrefix; the URL is
+// safe for hx-post / form action attributes. Returns "" for a
+// nil receiver or empty action name.
+func (c *ComponentContext) ActionURL(action string) string {
+	if c == nil || c.name == "" || action == "" {
+		return ""
+	}
+	prefix := DefaultActionPrefix
+	if c.Context != nil && c.Context.actionPrefix != "" {
+		prefix = c.Context.actionPrefix
+	}
+	return prefix + c.name + "/" + action
 }
 
 // Write writes a byte slice to the output. Convenience over Writer.
@@ -291,6 +318,11 @@ type Definition struct {
 	// — the render runs on the existing fast path with zero
 	// defer/recover overhead.
 	errBoundary ErrorBoundaryFunc
+
+	// actions are the colocated server actions registered via
+	// Action(name, fn). Keyed by action name; dispatched by
+	// Registry.HandleAction. nil when no actions are registered.
+	actions map[string]ActionFunc
 }
 
 // ErrorBoundaryFunc is the panic recovery callback for a component.
@@ -421,6 +453,33 @@ func (d *Definition) ErrorBoundary(fn ErrorBoundaryFunc) *Definition {
 	return d
 }
 
+// Action registers a colocated server action: mutation logic
+// that lives next to the component. The action is dispatched by
+// Registry.HandleAction when its URL is POSTed; after it runs,
+// the component re-renders with the post-action state.
+//
+//	name is the action name — it becomes part of the URL:
+//	{prefix}/{COMPONENT}/{name}. Use c.ActionURL(name) in the
+//	component's Render to generate the URL.
+//
+//	fn receives the per-request RenderContext and the parsed
+//	request body as props (JSON → typed map, forms → best-effort
+//	conversion). It should mutate the user's own storage — the
+//	framework does not persist state across requests.
+//
+// The action's error contract: returning nil triggers the
+// re-render; returning an error yields a 500 and no re-render.
+func (d *Definition) Action(name string, fn ActionFunc) *Definition {
+	if name == "" || fn == nil {
+		return d
+	}
+	if d.actions == nil {
+		d.actions = make(map[string]ActionFunc, 1)
+	}
+	d.actions[name] = fn
+	return d
+}
+
 // Register finalises the definition and registers it with the
 // ComponentRegistry.
 func (d *Definition) Register(cr *ComponentRegistry) {
@@ -440,6 +499,7 @@ func (d *Definition) Register(cr *ComponentRegistry) {
 		oobID:        d.oobID,
 		async:        async,
 		errBoundary:  d.errBoundary,
+		actions:      d.actions,
 	}
 	cr.Register(d.name, c)
 }
@@ -483,11 +543,19 @@ type fluentComponent struct {
 	oobID        string
 	async        bool
 	errBoundary  ErrorBoundaryFunc
+	actions      map[string]ActionFunc
 }
 
 // OOBID implements OOBOptioner. Returns the target DOM element id
 // when the component was declared with WithOOB(), or "" otherwise.
 func (f *fluentComponent) OOBID() string { return f.oobID }
+
+// LookupAction implements ActionProvider. Returns the colocated
+// server action registered under name, or ok=false.
+func (f *fluentComponent) LookupAction(name string) (ActionFunc, bool) {
+	fn, ok := f.actions[name]
+	return fn, ok
+}
 
 // ErrorBoundary returns the panic recovery callback registered via
 // Definition.ErrorBoundary, or nil if no boundary was set. The
@@ -693,6 +761,7 @@ func (f *fluentComponent) buildCtx(w ByteWriter, rc *RenderContext, data any, oo
 			DataMap:     asMap(data),
 			oobID:       oobID,
 			savedCtxPtr: ptr,
+			name:        f.name,
 		}
 	}
 	return &ComponentContext{
@@ -703,6 +772,7 @@ func (f *fluentComponent) buildCtx(w ByteWriter, rc *RenderContext, data any, oo
 		DataMap:     asMap(data),
 		oobID:       oobID,
 		savedCtxPtr: ptr,
+		name:        f.name,
 	}
 }
 
