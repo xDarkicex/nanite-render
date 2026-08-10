@@ -103,6 +103,79 @@ type RenderContext struct {
 	// the engine adapter or middleware. The executor reads this
 	// to dispatch component nodes.
 	componentRegistry *ComponentRegistry
+
+	// oobSink is the destination for HTMX Out-of-Band swap payloads
+	// when components with WithOOB mutate state during render. nil
+	// means OOB swaps write to Writer instead. Set via SetOOBSink.
+	// The router can target a separate stream (e.g. a trailing
+	// HTTP/2 frame) by pointing OOBSink elsewhere.
+	oobSink ByteWriter
+
+	// hxTriggers accumulates HTMX client-side event names during a
+	// render. Components call AddHXTrigger; the router reads
+	// HXTriggers() at the end of the handler to populate the
+	// HX-Trigger response header. nil until the first Add.
+	hxTriggers HXTriggers
+
+	// hxTriggersAfterSwap mirrors hxTriggers for events fired after
+	// the swap step. Populates the HX-Trigger-After-Swap header.
+	hxTriggersAfterSwap HXTriggers
+
+	// hxTriggersAfterSettle mirrors hxTriggers for events fired
+	// after the settle step. Populates the HX-Trigger-After-Settle
+	// header.
+	hxTriggersAfterSettle HXTriggers
+
+	// hmx holds server-driven HTMX response decisions (retarget,
+	// reswap, push-url, redirect, refresh, replace-url, location).
+	// Set via methods like SetHXRetarget; WriteHTMXHeaders applies
+	// the full set to the response writer at the end of the handler.
+	hmx HTMXResponse
+}
+
+// HTMXResponse bundles server-driven HTMX response decisions. The
+// router calls one method on RenderContext (e.g. SetHXRetarget) per
+// decision during the handler, then calls WriteHTMXHeaders once at
+// the end to apply everything to the response. Each field's zero
+// value means "leave the client-side default in place."
+//
+// Field reference (HTMX 2.x):
+//
+//	Retarget     — overrides hx-target on the triggered element
+//	Reswap       — overrides hx-swap on the triggered element
+//	PushURL      — pushes a new URL into history (true → use current, or a URL)
+//	Redirect     — triggers a client-side redirect (full URL required)
+//	Refresh      — triggers a full page refresh
+//	ReplaceURL   — replaces current URL without history entry (true or URL)
+//	Location     — triggers client-side navigation without history (full URL)
+//	Reselect     — CSS selector picking which part of the response to swap
+//	Resettle     — "true" forces scroll reset; "false" preserves scroll
+type HTMXResponse struct {
+	// Retarget overrides hx-target. CSS selector string.
+	Retarget string
+	// Reswap overrides hx-swap. e.g. "outerHTML", "innerHTML", "none".
+	Reswap string
+	// PushURL controls HX-Push-Url. Empty = unset. "true" pushes the
+	// current URL; any other value is treated as a URL to push.
+	PushURL string
+	// Redirect triggers a client-side redirect to the given URL.
+	Redirect string
+	// Refresh triggers a full page refresh when "true".
+	Refresh string
+	// ReplaceURL replaces the current URL without a history entry.
+	// Empty = unset. "true" replaces with the current URL; any
+	// other value is treated as the replacement URL.
+	ReplaceURL string
+	// Location triggers client-side navigation without history.
+	// Full URL required.
+	Location string
+	// Reselect is a CSS selector for the part of the response body
+	// HTMX should swap in. Useful when the server returns a wrapper
+	// and only an inner region should land.
+	Reselect string
+	// Resettle controls the post-swap settle algorithm. "true"
+	// forces scroll reset to the top; "false" preserves scroll.
+	Resettle string
 }
 
 // ComponentRegistry returns the active ComponentRegistry, if any.
@@ -113,6 +186,26 @@ func (rc *RenderContext) ComponentRegistry() *ComponentRegistry {
 // SetComponentRegistry binds a ComponentRegistry to this context.
 func (rc *RenderContext) SetComponentRegistry(c *ComponentRegistry) {
 	rc.componentRegistry = c
+}
+
+// SetOOBSink redirects HTMX Out-of-Band swap output for components
+// with WithOOB enabled. Pass nil to clear; OOBSink() then falls back
+// to Writer.
+//
+// Most handlers leave this nil — the main response is the swap —
+// but routers that want to interleave OOB updates with a different
+// stream (e.g. an SSE trailing chunk) can set it here.
+func (rc *RenderContext) SetOOBSink(w ByteWriter) {
+	rc.oobSink = w
+}
+
+// OOBSink returns the destination for OOB swap output. Falls back to
+// Writer when no explicit sink is configured.
+func (rc *RenderContext) OOBSink() ByteWriter {
+	if rc.oobSink != nil {
+		return rc.oobSink
+	}
+	return rc.Writer
 }
 
 // UserData returns the (possibly wrapped) data the injectors last
@@ -152,6 +245,18 @@ func AcquireContext(w ByteWriter, req *http.Request) *RenderContext {
 	rc.FuncMap = nil
 	rc.Times = nil
 	rc.Layout = ""
+	// Clear per-request fields that survive pool reuse. The auto-
+	// populate in Registry.renderNamed repopulates componentRegistry
+	// from the active registry's built-ins; clearing here prevents
+	// leaking the previous request's ComponentRegistry across calls.
+	rc.componentRegistry = nil
+	rc.ComponentFuncMap = nil
+	rc.ViewBytes = nil
+	rc.oobSink = nil
+	rc.hxTriggers = nil
+	rc.hxTriggersAfterSwap = nil
+	rc.hxTriggersAfterSettle = nil
+	rc.hmx = HTMXResponse{}
 	if rc.state == nil {
 		rc.state = NewState()
 	} else {
@@ -172,6 +277,15 @@ func ReleaseContext(rc *RenderContext) {
 	rc.FuncMap = nil
 	rc.Times = nil
 	rc.Layout = ""
+	rc.componentRegistry = nil
+	rc.ComponentFuncMap = nil
+	rc.ViewBytes = nil
+	rc.userData = nil
+	rc.oobSink = nil
+	rc.hxTriggers = nil
+	rc.hxTriggersAfterSwap = nil
+	rc.hxTriggersAfterSettle = nil
+	rc.hmx = HTMXResponse{}
 	rcPool.Put(rc)
 }
 
