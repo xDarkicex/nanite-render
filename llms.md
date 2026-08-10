@@ -517,6 +517,27 @@ without buffering the body:
 - `head.go` — the injector component, Set/Add/Title/UseId,
   precomputed ids, MetadataProvider.
 
+### 9.4 Asset dependencies (NANO_ASSETS)
+
+Components declare CSS/JS dependencies; the framework collects,
+dedupes, and emits them once in the head:
+
+- `c.RequiresCSS(href)` / `c.RequiresJS(src)` collect into two
+  `[16]string` inline arrays on RenderContext (zero alloc) with
+  heap-slice spillover past 16.
+- Linear-scan dedup (first occurrence wins) — a component
+  rendered 50 times in a loop emits one tag. No bitset: paths
+  are strings, and a linear scan over ≤16 slots is already
+  optimal.
+- `renderPageEngines` transfers the assets from the view context
+  to the layout context (same two-pass pipeline as head state);
+  the layout's `<NANO_ASSETS/>` (or `{{ nanoAssets }}`) emits
+  `<link rel="stylesheet">` + `<script defer>` — HTML-escaped.
+- Assets are collected on full page loads; partial HTMX swaps
+  inherit the already-loaded head.
+- `assets.go` — the injector component, RequiresCSS/RequiresJS,
+  ClearAssets.
+
 ---
 
 ## 10. HTMX first-class support

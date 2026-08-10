@@ -183,9 +183,10 @@ func (r *Registry) renderPageEngines(rc *RenderContext, layoutEngine, layout, vi
 
 	// Transfer head state and the id sequence from the view
 	// context to the main context: the layout renders with rc, so
-	// title/meta set during the view render (pass 1) must be
-	// visible to <NANO_HEAD/> in the layout (pass 2). The id
-	// sequence continues so page-wide UseId calls never collide.
+	// title/meta/assets set during the view render (pass 1) must
+	// be visible to <NANO_HEAD/> / <NANO_ASSETS/> in the layout
+	// (pass 2). The id sequence continues so page-wide UseId
+	// calls never collide.
 	rc.title = viewRc.title
 	inlineN := viewRc.metaN
 	if inlineN > metaInlineCap {
@@ -196,6 +197,26 @@ func (r *Registry) renderPageEngines(rc *RenderContext, layoutEngine, layout, vi
 	}
 	for _, kv := range viewRc.metaOverflow {
 		rc.AddMeta(kv.name, kv.content)
+	}
+	inlineN = viewRc.cssN
+	if inlineN > assetInlineCap {
+		inlineN = assetInlineCap
+	}
+	for i := 0; i < inlineN; i++ {
+		rc.RequiresCSS(viewRc.cssAssets[i])
+	}
+	for _, href := range viewRc.cssOverflow {
+		rc.RequiresCSS(href)
+	}
+	inlineN = viewRc.jsN
+	if inlineN > assetInlineCap {
+		inlineN = assetInlineCap
+	}
+	for i := 0; i < inlineN; i++ {
+		rc.RequiresJS(viewRc.jsAssets[i])
+	}
+	for _, src := range viewRc.jsOverflow {
+		rc.RequiresJS(src)
 	}
 	rc.idSeq = viewRc.idSeq
 

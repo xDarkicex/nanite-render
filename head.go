@@ -173,6 +173,7 @@ func (rc *RenderContext) ClearHeadState() {
 	rc.metaOverflow = rc.metaOverflow[:0]
 	rc.metaN = 0
 	rc.idSeq = 0
+	rc.ClearAssets()
 }
 
 // UseId returns a stable, unique identifier for this request,

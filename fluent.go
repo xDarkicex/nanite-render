@@ -247,6 +247,27 @@ func (c *ComponentContext) UseId() string {
 	return c.Context.UseId()
 }
 
+// RequiresCSS declares a CSS dependency for this component. The
+// path is emitted once (deduplicated) by the layout's
+// <NANO_ASSETS/> as a <link rel="stylesheet"> tag. Safe to call
+// from components rendered in loops — the head gets one tag.
+func (c *ComponentContext) RequiresCSS(href string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.RequiresCSS(href)
+}
+
+// RequiresJS declares a JS dependency for this component. The
+// path is emitted once (deduplicated) by the layout's
+// <NANO_ASSETS/> as a <script defer> tag.
+func (c *ComponentContext) RequiresJS(src string) {
+	if c == nil || c.Context == nil {
+		return
+	}
+	c.Context.RequiresJS(src)
+}
+
 // Render dispatches a named, registered component inline, writing to
 // this context's writer. The component receives a fresh
 // ComponentContext (same state, its own data). This is the

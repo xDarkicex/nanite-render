@@ -183,6 +183,10 @@ func NewRegistry(engines ...Engine) *Registry {
 	// collected via SetTitle/AddMeta. Same pattern as PRELOADS —
 	// users may override via AttachComponents for custom emission.
 	r.components.Load().Register("NANO_HEAD", &nanoHeadComponent{})
+	// NANO_ASSETS emits the deduplicated CSS/JS dependencies
+	// collected via RequiresCSS/RequiresJS. Typically placed next
+	// to <NANO_HEAD/> in the layout's <head>.
+	r.components.Load().Register("NANO_ASSETS", &nanoAssetsComponent{})
 	// Register a default FuncMap builder so templates get the
 	// standard helpers (useState, get, set, useContext, formError,
 	// nanoHead) without any opt-in. Users can call WithFuncMap to
@@ -233,6 +237,9 @@ func defaultFuncMap(rc *RenderContext) template.FuncMap {
 		},
 		"nanoHead": func() string {
 			return headTagsString(rc)
+		},
+		"nanoAssets": func() string {
+			return assetTagsString(rc)
 		},
 	}
 }

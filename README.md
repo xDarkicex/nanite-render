@@ -395,6 +395,7 @@ nanite-render gives you a React-flavoured composition model in Go — components
 | `useActionState` / form validation | [`rc.SetFormError` / `c.GetFormError` + `ErrValidation`](#flash-form-validation-react-useactionstate-style) — flash errors, inline re-render, no cookies or redirects |
 | `<Head>` / `generateMetadata` | [`c.SetTitle` / `c.AddMeta` + `<NANO_HEAD/>`](#deep-document-head-management-nextjs-head) — two-pass head injection, no body buffering |
 | `useId` | [`c.UseId()`](#stable-server-side-ids-useid) — per-request unique ids, zero-alloc first 256 |
+| Asset deps (import side effects) | [`c.RequiresCSS` / `c.RequiresJS` + `<NANO_ASSETS/>`](#asset-dependency-graph-nano_assets) — deduplicated head emission |
 | Inline composition (`<Navbar/>`) | [`c.Render("Navbar", props)`](#the-fluent-builder) |
 
 The same component runs identically from **templ**, **html/template**, **jade**, and **plain HTML** — the React layer is engine-agnostic.
@@ -844,6 +845,43 @@ cr.Define("INPUT_FIELD").
 ```
 
 The first 256 ids come from a precomputed static array — zero allocation. The sequence is per-request (reset on pool reuse) and continues across the view → layout boundary so page-wide ids never collide. Unlike React, ids are a per-request sequence rather than stable per component instance — uniqueness (what label/input pairing needs) is what's guaranteed.
+
+---
+
+## Asset Dependency Graph (`<NANO_ASSETS/>`)
+
+Components declare their CSS/JS dependencies; the framework collects them during the render pass, deduplicates, and emits them once in the head. No invalid markup from `<link>`/`<script>` inside component bodies, no duplicate downloads from components rendered in loops:
+
+```go
+cr.Define("CHART_WIDGET").
+    Render(func(c *render.ComponentContext) error {
+        c.RequiresCSS("/static/css/chart.css")
+        c.RequiresJS("/static/js/chart.js")
+        // ... component body, safe to render in a loop
+    }).
+    Register(cr)
+```
+
+```html
+<!-- layouts/app.html -->
+<html>
+  <head><NANO_HEAD/><NANO_ASSETS/></head>
+  <body>{{ yield }}</body>
+</html>
+```
+
+`<NANO_ASSETS/>` (plain HTML) / `{{ nanoAssets }}` (template engines) emits:
+
+```html
+<link rel="stylesheet" href="/static/css/chart.css">
+<script defer src="/static/js/chart.js"></script>
+```
+
+**Deduplication:** a linear scan over the inline arrays — at ≤16 slots it's already optimal (no bitset needed for string paths). First occurrence wins, so emission order = first render order (deterministic — the executor walks the tree in order). A card rendered 50 times in a loop emits one tag; the browser downloads the asset once.
+
+**Zero-alloc:** two `[16]string` inline arrays (CSS + JS) on the `RenderContext` with heap-slice spillover past 16 — the same pattern as meta tags and form errors. Values are HTML-escaped.
+
+**Partial swaps:** assets are collected on full page loads; later `hx-get`/`hx-post` swaps inherit the already-loaded head. If a component is loaded via swap without a prior full page load, its assets won't be in the head — load the page first (or include the tags explicitly in the swap response).
 
 ---
 

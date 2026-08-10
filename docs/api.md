@@ -1022,6 +1022,39 @@ continues across the view → layout boundary.
 
 ---
 
+## Asset Dependency Graph
+
+```go
+// RenderContext / ComponentContext:
+func (rc *RenderContext) RequiresCSS(href string)
+func (rc *RenderContext) RequiresJS(src string)
+func (c *ComponentContext) RequiresCSS(href string)
+func (c *ComponentContext) RequiresJS(src string)
+
+// Built-in component + FuncMap helper:
+//   <NANO_ASSETS/>  (plain HTML)  — emits <link rel="stylesheet"> + <script defer>
+//   {{ nanoAssets }} (template)   — same
+```
+
+Components declare their CSS/JS dependencies; `renderPageEngines`
+transfers the collected assets from the view context to the
+layout context (same two-pass pipeline as head metadata), and
+`<NANO_ASSETS/>` emits them deduplicated.
+
+Storage: two `[16]string` inline arrays (CSS + JS) on
+RenderContext with heap-slice spillover past 16 — zero alloc on
+the fast path, same pattern as meta tags and form errors.
+
+Deduplication: linear scan over the inline arrays (optimal at
+≤16 slots; no bitset needed for string paths). First occurrence
+wins — emission order = first render order (deterministic tree
+walk). Hrefs/srcs are HTML-escaped.
+
+Partial swaps: assets are collected on full page loads; swaps
+inherit the already-loaded head.
+
+---
+
 ## HTMX — first-class support
 
 nanite-render implements 100% of the HTMX 2.0 server-side contract.

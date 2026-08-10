@@ -190,6 +190,17 @@ type RenderContext struct {
 	metaOverflow   []metaKV
 	metaN          int
 	idSeq          int
+
+	// Asset dependencies collected during the render pass via
+	// RequiresCSS / RequiresJS; emitted by <NANO_ASSETS/> /
+	// {{ nanoAssets }}. Deduplicated, first occurrence wins.
+	// Cleared on pool reuse.
+	cssAssets    [assetInlineCap]string
+	cssOverflow  []string
+	cssN         int
+	jsAssets     [assetInlineCap]string
+	jsOverflow   []string
+	jsN          int
 }
 
 // contextKV is one slot on the cascading-context stack. Stored
