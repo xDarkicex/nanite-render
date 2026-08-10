@@ -1022,6 +1022,31 @@ continues across the view → layout boundary.
 
 ---
 
+## Hydration prop serialization
+
+```go
+// ComponentContext:
+func (c *ComponentContext) WriteHydrateProps(attr string, props any) error
+```
+
+Serializes props as JSON into a single-quoted HTML attribute —
+the hydration bridge for Alpine.js (`x-data`), HTMX extensions,
+and vanilla JS. Output: `x-data='{"min":0,"max":100}'`.
+
+Escaping: the JSON bytes are streamed through `escapeBytes`
+(no `string(b)` conversion), and `encoding/json` itself
+HTML-escapes `<>&` — double coverage; browsers entity-decode the
+attribute value, so the client sees the exact JSON. Single-quoted
+attribute: JSON contains `"` but not `'`, so only apostrophes
+need escaping.
+
+Allocation note: `json.Marshal` allocates — this is a
+correctness helper, not a zero-alloc one. Marshal failures
+(channels, functions, cycles) return an error with nothing
+written.
+
+---
+
 ## Asset Dependency Graph
 
 ```go

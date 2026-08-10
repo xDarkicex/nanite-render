@@ -879,6 +879,25 @@ cr.Define("CHART_WIDGET").
 
 **Deduplication:** a linear scan over the inline arrays — at ≤16 slots it's already optimal (no bitset needed for string paths). First occurrence wins, so emission order = first render order (deterministic — the executor walks the tree in order). A card rendered 50 times in a loop emits one tag; the browser downloads the asset once.
 
+### Hydration prop serialization (`WriteHydrateProps`)
+
+Bridge server state into client-side frameworks (Alpine.js `x-data`, HTMX extensions, vanilla JS) without hand-rolled string concatenation:
+
+```go
+cr.Define("INTERACTIVE_SLIDER").
+    Render(func(c *render.ComponentContext) error {
+        props := render.BindProps[SliderProps](c.Data)
+        c.WriteString(`<div `)
+        c.WriteHydrateProps("x-data", props) // x-data='{"min":0,"max":100}'
+        c.WriteString(`>`)
+        return nil
+    })
+```
+
+The JSON is written inside single quotes with every byte HTML-escaped (via `escapeBytes`, streaming — no extra `string(b)` conversion). `encoding/json` itself HTML-escapes `<>&` to `<...>`, so injection is double-covered; browsers entity-decode the attribute, so the client sees the exact JSON.
+
+Honest allocation note: `json.Marshal` allocates — this is a **correctness helper** (escaping, no manual concat), not a zero-alloc one. It runs once per component per render. Marshal failures (channels, functions, cycles) return an error and nothing is written.
+
 **Zero-alloc:** two `[16]string` inline arrays (CSS + JS) on the `RenderContext` with heap-slice spillover past 16 — the same pattern as meta tags and form errors. Values are HTML-escaped.
 
 **Partial swaps:** assets are collected on full page loads; later `hx-get`/`hx-post` swaps inherit the already-loaded head. If a component is loaded via swap without a prior full page load, its assets won't be in the head — load the page first (or include the tags explicitly in the swap response).

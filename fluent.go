@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
@@ -86,6 +87,48 @@ func (c *ComponentContext) Write(p []byte) (int, error) { return c.Writer.Write(
 
 // WriteString writes a string to the output.
 func (c *ComponentContext) WriteString(s string) (int, error) { return c.Writer.WriteString(s) }
+
+// WriteHydrateProps serializes props as JSON into a single-quoted
+// HTML attribute — the hydration bridge for Alpine.js (x-data),
+// HTMX extensions, and vanilla JS:
+//
+//	c.WriteHydrateProps("x-data", props)
+//	// writes: x-data='{"min":0,"max":100}'
+//
+// The JSON is written inside single quotes (JSON contains " but
+// not '), and every byte is HTML-escaped via escapeBytes — the
+// browser decodes entities when reading the attribute, so the
+// client-side JS sees the exact JSON. Safe against quote/script
+// injection in values.
+//
+// Allocation note: encoding/json.Marshal allocates — this is a
+// CORRECTNESS helper (proper escaping, no manual string concat),
+// not a zero-alloc one. It runs once per component per render.
+// The escape step streams the bytes directly (no string(b)
+// conversion) so no extra allocation is added on our side.
+//
+// Returns an error if props cannot be marshaled (e.g. channels,
+// functions, cyclic values).
+func (c *ComponentContext) WriteHydrateProps(attr string, props any) error {
+	if c == nil || c.Writer == nil {
+		return nil
+	}
+	b, err := json.Marshal(props)
+	if err != nil {
+		return err
+	}
+	if _, err := c.Writer.WriteString(attr); err != nil {
+		return err
+	}
+	if _, err := c.Writer.WriteString(`='`); err != nil {
+		return err
+	}
+	if err := escapeBytes(c.Writer, b); err != nil {
+		return err
+	}
+	_, err = c.Writer.WriteString(`'`)
+	return err
+}
 
 // WriteChildren writes all slot-less children to the output. The
 // component controls the placement; the framework just provides

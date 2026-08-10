@@ -538,6 +538,24 @@ dedupes, and emits them once in the head:
 - `assets.go` — the injector component, RequiresCSS/RequiresJS,
   ClearAssets.
 
+### 9.5 Hydration props (WriteHydrateProps)
+
+`c.WriteHydrateProps(attr, props)` serializes props as JSON into
+a single-quoted HTML attribute for Alpine.js/HTMX-ext/vanilla JS
+hydration: `x-data='{"min":0,"max":100}'`.
+
+- JSON bytes stream through `escapeBytes` (no `string(b)`);
+  `encoding/json` already HTML-escapes `<>&` — double coverage.
+  Browsers entity-decode the attribute, so clients see exact JSON.
+- `json.Marshal` allocates — correctness helper, NOT zero-alloc.
+  Marshal failures return an error with nothing written.
+- Single-quoted attribute: JSON has `"` but never `'`, so only
+  apostrophes need escaping (escapeBytes handles all five anyway).
+
+---
+
+## 10. HTMX first-class support
+
 ---
 
 ## 10. HTMX first-class support
