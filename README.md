@@ -378,7 +378,22 @@ No hardcoded keys — inject anything.
 
 ## React-style components
 
-nanite-render gives you a React-flavoured composition model in Go.
+nanite-render gives you a React-flavoured composition model in Go — components, typed props, hooks, context, error boundaries, and Suspense, all server-side, all zero-alloc where it matters.
+
+| React concept | nanite-render equivalent |
+|---|---|
+| JSX component | `cr.Define("NAME").Render(fn).Register(cr)` — the [fluent builder](#the-fluent-builder) |
+| Props | `c.Data` + [`render.BindProps[T]`](#type-safe-props) — typed, zero-alloc |
+| `props.children` | [`c.WriteChildren()`](#named-slots) + named slots `c.WriteSlot("name")` |
+| `useState` / state hooks | [`c.UseState(key, initial)` / `render.UseState[T]`](#per-component-state-hooks) |
+| Context (`createContext` / `useContext`) | [`c.ProvideContext` / `c.UseContext`](#cascading-context-react-style-zero-alloc) — zero-alloc stack, auto-scoped |
+| Error Boundaries (`componentDidCatch`) | [`cr.Define(...).ErrorBoundary(fn)`](#error-boundaries-panic-isolation) |
+| `<Suspense>` / `fallback` | [`cr.Define(...).Async().Fallback(fn)`](#server-side-suspense-async--fallback) — server-side, streams via HTMX OOB |
+| `React.memo` | [`cr.Memoize(name, keyer)`](#per-component-memoization) |
+| `createPortal` (render elsewhere) | [`WithOOB(id)`](#out-of-band-swaps-hx-swap-oobtrue) — HTMX out-of-band swaps |
+| Inline composition (`<Navbar/>`) | [`c.Render("Navbar", props)`](#the-fluent-builder) |
+
+The same component runs identically from **templ**, **html/template**, **jade**, and **plain HTML** — the React layer is engine-agnostic.
 
 ### The fluent builder
 
