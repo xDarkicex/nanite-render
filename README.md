@@ -485,6 +485,27 @@ cr.Define("NAVBAR").
     Register(cr)
 ```
 
+**Zero allocations.** `BindProps[T]` binds `nanite:"key"` tags from
+a `map[string]any` into a typed struct with **0 B/op, 0 allocs** on
+the scalar fast path:
+
+- Per-type field layouts (byte offsets + exact types + resolved
+  tag keys) are built once per distinct `T` via reflection and
+  cached; the hot path never touches reflection.
+- Scalar fields (string, bool, int*, uint*, float*) are written
+  directly via `unsafe.Pointer` arithmetic — typed stores at
+  computed struct offsets.
+- The props struct stays on the stack (the runtime's `noescape`
+  intrinsic defeats escape analysis' conservative handling of
+  `unsafe.Pointer` args).
+- Custom named types (`type UserID string`) and complex fields
+  (slices, maps, pointers, nested structs) fall through to a
+  reflect-based slow path that respects assignability.
+
+Measured (Apple M2, scalar 4-field struct): **137 ns/op, 0 B/op**,
+down from 246 ns/op and 48 B/op for the previous reflect
+implementation.
+
 ---
 
 ## Superpowers

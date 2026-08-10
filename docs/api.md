@@ -464,6 +464,32 @@ func BindProps[T any](data any) T
 
 Uses `nanite:"key"` struct tags; default key is the lowercased field name.
 
+Zero heap allocations on the scalar fast path:
+
+- Per-type field layouts (byte offset, exact `reflect.Type`,
+  kind, resolved tag key) are built once via reflection and
+  cached in a `sync.Map` keyed by `reflect.Type`. Reflection
+  never runs on the hot path.
+- Scalar fields (string, bool, int*, uint*, float*) are written
+  directly via `unsafe.Pointer` offset arithmetic — typed stores
+  at computed struct offsets, no `reflect.Value.Set`.
+- The props struct stays on the stack: the runtime's
+  `noescape` intrinsic (via `//go:linkname`) tells the escape
+  analyzer that the `unsafe.Pointer` arg to the binder doesn't
+  escape, defeating its conservative heap allocation.
+- Custom named types (`type UserID string`) and complex fields
+  (slices, maps, pointers, nested structs) fall through to
+  `reflect.Value.Set` — assignability-respecting, may allocate
+  only for those fields.
+
+Measured: 137 ns/op, 0 B/op on a scalar 4-field struct (was
+246 ns/op, 48 B/op with the previous reflect implementation).
+
+Semantics: missing keys leave fields at zero; type mismatches
+leave fields at zero; `nanite:"key"` tags, lowercased-name
+defaults, nested structs, and pointer-to-struct binding all
+preserved.
+
 ---
 
 ## Async / Suspense (server-side streaming)

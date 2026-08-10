@@ -208,6 +208,11 @@ props := render.BindProps[NavbarProps](c.Data)
 
 Default key = lowercased field name. Type mismatch → zero value.
 
+Zero-alloc: scalar fields are written via `unsafe.Pointer`
+offset arithmetic (0 B/op, layout cached per type). Custom named
+types and complex fields (slices/maps/pointers/nested structs)
+fall back to reflection.
+
 ### State (React hooks style)
 
 ```go
@@ -374,8 +379,14 @@ the `Fallback`.
    The loader-cache pattern does this automatically.
 2. **The plain HTML engine does NOT interpolate.** `{{.Var}}` renders
    literally. Use jade or HTMLTemplate for data binding.
-3. **`BindProps` is reflection** — correct but not free. It runs once per
-   component render.
+3. **`BindProps` is zero-alloc on the scalar fast path.** Per-type
+   field layouts are cached; scalar fields are written via
+   `unsafe.Pointer` arithmetic (0 B/op). Complex fields (slices,
+   maps, pointers, nested structs) and custom named types fall back
+   to reflection — those fields can allocate. The stack residency
+   depends on the runtime's `noescape` intrinsic, so don't pass
+   `unsafe.Pointer(&props)` from `BindProps` through additional
+   non-inlined call boundaries.
 4. **Global superpower state** is single-mutex-guarded. Fine for
    one-goroutine-per-request servers.
 5. **`engine.Templ`** does not implement the full `Engine.Execute`
