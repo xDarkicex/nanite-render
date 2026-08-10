@@ -1047,6 +1047,49 @@ written.
 
 ---
 
+## Component Middleware
+
+```go
+// Definition (fluent builder):
+func (d *Definition) Use(mw ...ComponentMiddleware) *Definition
+
+type ComponentMiddleware func(ComponentRenderFunc) ComponentRenderFunc
+
+// Dispatchable — engines can implement directly:
+type Dispatchable interface {
+    Component
+    Dispatch(w ByteWriter, rc *RenderContext, data any, children Children) error
+}
+```
+
+React HOC pattern, router-agnostic: `cr.Define("X").Use(RequireAdmin, LogRender).Render(...)`.
+The chain folds ONCE at Register around a dispatcher base; the
+hot path calls a single function pointer (zero iteration, zero
+alloc). First `.Use()` is the outermost wrapper.
+
+Middleware wraps the component DISPATCHER, not the inner render:
+
+- The executor (emitComponent, bcVM.dispatch, renderComponent)
+  routes Dispatchable components through `Dispatch`, so the chain
+  runs on the main thread BEFORE any async fork.
+- An abort (not calling `next`) prevents the async fallback from
+  being written and the worker from being spawned — `.Use()`
+  protection survives a later `.Async()` addition.
+- Middleware has full cascading context access (pre-fork).
+  The async worker runs the raw render function; middleware runs
+  exactly once on the main thread.
+- Sync components: the chain runs inside Render's machinery —
+  OOB buffering, error-boundary recover, and cascade auto-pop
+  wrap the middleware. Middleware writes join the component's
+  output; middleware panics are caught by the boundary.
+
+Boundary: children are evaluated eagerly before dispatch. Use
+`.Use()` for leaf gating and micro-interactions, not massive
+page layouts — use HTTP router middleware for route-level
+protection.
+
+---
+
 ## Asset Dependency Graph
 
 ```go

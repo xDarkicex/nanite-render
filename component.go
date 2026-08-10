@@ -160,10 +160,26 @@ type ComponentWithChildren interface {
 	RenderWithChildren(w ByteWriter, rc *RenderContext, data any, children Children) error
 }
 
+// Dispatchable is an optional interface a Component implements
+// to take full control of its dispatch: middleware wrapping,
+// async forking, children handling. The executor and
+// renderComponent call Dispatch INSTEAD of the async check +
+// Render path. The fluent builder implements this via .Use().
+type Dispatchable interface {
+	Component
+	Dispatch(w ByteWriter, rc *RenderContext, data any, children Children) error
+}
+
 // renderComponent dispatches to RenderWithChildren if the component
 // implements it, otherwise to Render. The children are passed via
 // ChildrenDataKey in the data map for components that don't.
 func renderComponent(c Component, w ByteWriter, rc *RenderContext, data any, children Children) error {
+	// Dispatchable components (fluent + middleware) handle their
+	// own dispatch — including any async fork — so middleware can
+	// gate the fork before it happens.
+	if d, ok := c.(Dispatchable); ok {
+		return d.Dispatch(w, rc, data, children)
+	}
 	if len(children) == 0 {
 		return renderComponentWithFuncMap(c, w, rc, data)
 	}

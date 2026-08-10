@@ -124,6 +124,14 @@ func (bc *Bytecode) emit(nodes NodeStream, i int) {
 		bc.dynamic(opComponent, ci, 0)
 		start := len(bc.code) - 1
 		bc.emitChildren(nodes, i)
+		// CRITICAL: flush the children's static bytes INSIDE the
+		// component's range. Static bytes only become instructions
+		// via dynamic/flush; without this, a component whose
+		// children are entirely static (e.g. <PANEL><span>child</span>
+		// </PANEL>) would have its children flushed at the END of
+		// the program — leaking them into the main stream after the
+		// component and starving collectChildren of the range.
+		bc.flushStatic()
 		// Backpatch the children end index (exclusive).
 		bc.code[start] = inst(opComponent, ci, uint32(len(bc.code)))
 	case flags&(FlagVoid|FlagSelfClosing) != 0:
@@ -269,6 +277,22 @@ func (vm *bcVM) dispatch(name string, w ByteWriter, children Children, slots Slo
 		// components.
 		_, err := io.WriteString(w, "<!-- missing component: "+name+" -->")
 		return err
+	}
+	// Dispatchable components (fluent + middleware) handle their
+	// own dispatch, gating any async fork before it happens.
+	if d, ok := c.(Dispatchable); ok {
+		data := vm.data
+		if len(slots) > 0 {
+			if data == nil {
+				data = make(map[string]any)
+			}
+			if m, ok := data.(map[string]any); ok {
+				m[SlotsDataKey] = slots
+			} else {
+				data = map[string]any{"_data": data, SlotsDataKey: slots}
+			}
+		}
+		return d.Dispatch(w, vm.rc, data, children)
 	}
 	// Async dispatch: same as the tree executor's emitComponent —
 	// write fallback inline and run the render in a worker. The

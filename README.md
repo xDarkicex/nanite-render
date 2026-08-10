@@ -396,6 +396,7 @@ nanite-render gives you a React-flavoured composition model in Go — components
 | `<Head>` / `generateMetadata` | [`c.SetTitle` / `c.AddMeta` + `<NANO_HEAD/>`](#deep-document-head-management-nextjs-head) — two-pass head injection, no body buffering |
 | `useId` | [`c.UseId()`](#stable-server-side-ids-useid) — per-request unique ids, zero-alloc first 256 |
 | Asset deps (import side effects) | [`c.RequiresCSS` / `c.RequiresJS` + `<NANO_ASSETS/>`](#asset-dependency-graph-nano_assets) — deduplicated head emission |
+| HOC (`withAuth(Widget)`) | [`cr.Define(...).Use(mw)`](#component-middleware-use--react-hoc-pattern) — dispatcher-wrapping middleware, gates async forks |
 | Inline composition (`<Navbar/>`) | [`c.Render("Navbar", props)`](#the-fluent-builder) |
 
 The same component runs identically from **templ**, **html/template**, **jade**, and **plain HTML** — the React layer is engine-agnostic.
@@ -901,6 +902,39 @@ Honest allocation note: `json.Marshal` allocates — this is a **correctness hel
 **Zero-alloc:** two `[16]string` inline arrays (CSS + JS) on the `RenderContext` with heap-slice spillover past 16 — the same pattern as meta tags and form errors. Values are HTML-escaped.
 
 **Partial swaps:** assets are collected on full page loads; later `hx-get`/`hx-post` swaps inherit the already-loaded head. If a component is loaded via swap without a prior full page load, its assets won't be in the head — load the page first (or include the tags explicitly in the swap response).
+
+---
+
+## Component Middleware (`.Use()`) — React HOC pattern
+
+Router-agnostic Higher-Order Components: wrap a component's dispatch with gating logic — feature flags, A/B tests, component-level authorization:
+
+```go
+func RequireAdmin(next render.ComponentRenderFunc) render.ComponentRenderFunc {
+    return func(c *render.ComponentContext) error {
+        if role, ok := c.UseContext("role").(string); !ok || role != "admin" {
+            return nil // abort — component renders nothing
+        }
+        return next(c)
+    }
+}
+
+cr.Define("ADMIN_BUTTON").
+    Use(RequireAdmin, LogRender).   // first = outermost
+    Render(func(c *render.ComponentContext) error {
+        return c.WriteString(`<button>Delete</button>`)
+    }).
+    Register(cr)
+```
+
+**The dispatcher topology** (this is what makes it secure):
+
+- Middleware wraps the component's **dispatcher**, not just the render function. The chain runs on the main thread **before any async fork** — so it has full access to cascading context (`c.UseContext`), and an abort (not calling `next`) means **the async fallback is never written and the worker is never spawned**. Protecting a component with `.Use(RequireAdmin)` stays protective even if someone later marks it `.Async()`.
+- The async worker runs the raw render function — middleware runs exactly once, on the main thread.
+- Sync components: the chain runs inside the render machinery, so OOB buffering and the error boundary wrap the middleware. Middleware writes join the component's output (OOB-wrapped when dirty); middleware panics are caught by the boundary.
+- Folded once at `Register` — the hot path calls a single function pointer. Zero runtime iteration, zero allocations.
+
+**Boundary:** children are evaluated eagerly (pre-rendered before dispatch). `.Use()` is for gating leaf components and micro-interactions — **not** massive page layouts. Use HTTP router middleware for route-level protection.
 
 ---
 

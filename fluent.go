@@ -372,6 +372,38 @@ func Props[T any](c *ComponentContext) T {
 // the render arguments.
 type ComponentRenderFunc func(c *ComponentContext) error
 
+// ComponentMiddleware is a Higher-Order Component wrapper in the
+// React withAuth(Widget) style. It receives the next render
+// function and returns a wrapped one:
+//
+//	func RequireAdmin(next render.ComponentRenderFunc) render.ComponentRenderFunc {
+//	    return func(c *render.ComponentContext) error {
+//	        if !isAdmin(c) {
+//	            return nil // abort — component renders nothing
+//	        }
+//	        return next(c)
+//	    }
+//	}
+//	cr.Define("ADMIN_BUTTON").Use(RequireAdmin).Render(...)
+//
+// The chain is folded ONCE at Register time — the hot render path
+// calls a single function pointer, zero iteration, zero
+// allocation.
+//
+// Middleware wraps the component DISPATCHER, not just the render
+// function: it runs on the main thread BEFORE the async fork, so
+// it has full access to cascading context (c.UseContext), and an
+// abort (not calling next) prevents the async fallback from
+// being written and the worker from being spawned. The async
+// worker itself runs the raw render function — middleware runs
+// exactly once, on the main thread.
+//
+// Children are evaluated eagerly (pre-rendered before dispatch),
+// so .Use is for gating leaf components and micro-interactions —
+// not massive page layouts. Use HTTP router middleware for
+// route-level protection.
+type ComponentMiddleware func(ComponentRenderFunc) ComponentRenderFunc
+
 // panicValue is a sentinel error wrapping a recovered panic value.
 // The boundary path checks for this type to distinguish "user
 // render panicked" from "user render returned an error". The
@@ -443,6 +475,10 @@ type Definition struct {
 	// metadata is the head-metadata closure run before the page
 	// streams (see MetadataProvider). nil when not registered.
 	metadata func(rc *RenderContext, data any) error
+
+	// middlewares are the HOC wrappers registered via Use(...).
+	// Folded into a single chain at Register time.
+	middlewares []ComponentMiddleware
 }
 
 // ErrorBoundaryFunc is the panic recovery callback for a component.
@@ -600,6 +636,26 @@ func (d *Definition) Action(name string, fn ActionFunc) *Definition {
 	return d
 }
 
+// Use registers component middleware (HOC wrappers). The chain
+// is folded once at Register time around the component's
+// dispatcher; the first middleware registered is the OUTERMOST
+// wrapper (closest to the framework machinery), the last is the
+// INNERMOST (closest to the render function) — standard
+// middleware ordering.
+//
+//	cr.Define("ADMIN_BUTTON").
+//	    Use(RequireAdmin, LogRender).
+//	    Render(...)
+//
+// Middleware runs on the main thread before any async fork, has
+// full access to cascading context, and aborts by not calling
+// next (nothing renders, no worker spawns). See
+// ComponentMiddleware for the full contract.
+func (d *Definition) Use(mw ...ComponentMiddleware) *Definition {
+	d.middlewares = append(d.middlewares, mw...)
+	return d
+}
+
 // Metadata registers a head-metadata closure that runs BEFORE
 // the page streams (see MetadataProvider). It receives the page
 // data and sets the document title / meta tags via
@@ -648,6 +704,23 @@ func (d *Definition) Register(cr *ComponentRegistry) {
 		actions:      d.actions,
 		metadata:     d.metadata,
 	}
+	// Fold the middleware chain ONCE here, around a base that
+	// dispatches: async components fork (fallback inline + worker
+	// spawn), sync components run the render function. The same
+	// folded chain serves both paths — middleware runs on the
+	// main thread before the fork, and an abort (not calling
+	// next) prevents the fallback AND the worker.
+	base := func(ctx *ComponentContext) error {
+		if c.async {
+			return c.forkAsync(ctx)
+		}
+		return c.fn(ctx)
+	}
+	chain := base
+	for i := len(d.middlewares) - 1; i >= 0; i-- {
+		chain = d.middlewares[i](chain)
+	}
+	c.chain = chain
 	cr.Register(d.name, c)
 }
 
@@ -692,6 +765,12 @@ type fluentComponent struct {
 	errBoundary  ErrorBoundaryFunc
 	actions      map[string]ActionFunc
 	metadata     func(rc *RenderContext, data any) error
+
+	// chain is the folded middleware chain (or the base dispatcher
+	// when no middleware is registered). The hot path calls this
+	// single function pointer — registration-time folding, zero
+	// runtime iteration.
+	chain ComponentRenderFunc
 }
 
 // OOBID implements OOBOptioner. Returns the target DOM element id
@@ -723,6 +802,100 @@ func (f *fluentComponent) ErrorBoundary() ErrorBoundaryFunc { return f.errBounda
 // suspense coordinator (write fallback + spawn worker) or render
 // synchronously.
 func (f *fluentComponent) IsAsync() bool { return f.async }
+
+// Dispatch implements Dispatchable — the single entry the
+// executor and renderComponent call for fluent components. The
+// middleware chain wraps the DISPATCHER: it runs on the main
+// thread BEFORE any async fork, so middleware has full access to
+// cascading context, and an abort (not calling next) prevents
+// the async fallback from being written AND the worker from
+// being spawned.
+//
+// Async path: the chain runs with a context on the main writer;
+// the innermost next() (forkAsync) writes the fallback inline and
+// spawns the worker, which renders the raw render function.
+//
+// Sync path: the chain runs inside Render's machinery — fast
+// path, OOB buffering, and the error-boundary recover all wrap
+// the middleware, so middleware writes join the component's
+// output and middleware panics are caught by the boundary.
+func (f *fluentComponent) Dispatch(w ByteWriter, rc *RenderContext, data any, children Children) error {
+	// Stash children into the data map (mimic renderComponent's
+	// map path) so buildCtx can extract them.
+	if len(children) > 0 {
+		if data == nil {
+			data = make(map[string]any)
+		}
+		if m, ok := data.(map[string]any); ok {
+			m[ChildrenDataKey] = children
+		} else {
+			data = map[string]any{"_data": data, ChildrenDataKey: children}
+		}
+	}
+	if f.async {
+		// Middleware runs on the main writer before the fork.
+		if rc != nil {
+			prev := rc.ComponentFuncMap
+			if f.funcs != nil {
+				rc.ComponentFuncMap = f.funcs
+			}
+			defer func() { rc.ComponentFuncMap = prev }()
+		}
+		ctx := f.buildCtx(w, rc, data, f.oobID)
+		// The fallback can render children even when the component
+		// was declared with plain .Render() — extract them so
+		// c.WriteChildren() works in the fallback. (Sync renders
+		// keep the documented semantics: plain .Render() components
+		// don't receive children; use RenderChildren to opt in.)
+		if ctx.Children == nil {
+			ctx.Children = extractChildren(data)
+		}
+		if rc != nil {
+			defer rc.PopContextTo(ctx.savedCtxPtr)
+		}
+		return f.chain(ctx)
+	}
+	// Sync: the chain runs inside Render's machinery.
+	return f.Render(w, rc, data)
+}
+
+// forkAsync is the innermost next() for async components: write
+// the fallback to the main stream, flush so it hits the wire
+// immediately, and spawn the worker that renders the real output
+// as a trailing OOB chunk. The worker runs the raw render
+// function — middleware already ran on the main thread before
+// the fork.
+//
+// Returns an error only when the fallback itself fails. The
+// worker's failures are handled by the suspense coordinator
+// (boundary or silent drop).
+func (f *fluentComponent) forkAsync(ctx *ComponentContext) error {
+	rc := ctx.Context
+	if rc == nil {
+		// No request context (superpower dispatch) — render sync.
+		return f.fn(ctx)
+	}
+	coord := rc.EnsureSuspense(ctx.Writer)
+	if coord == nil {
+		// Writer doesn't support suspense — render sync.
+		return f.fn(ctx)
+	}
+	// Fallback inline, with the full context — including Children,
+	// which the executor previously never collected for async
+	// components (fallbacks can now use c.WriteChildren()).
+	if err := f.fallback(ctx); err != nil {
+		return err
+	}
+	if fw, ok := ctx.Writer.(interface{ Flush() error }); ok {
+		_ = fw.Flush()
+	}
+	id, fn := f.AsyncFallback()
+	if id == "" || fn == nil {
+		return nil
+	}
+	rc.SubmitAsync(id, fn, f.errBoundary, ctx.Data)
+	return nil
+}
 
 // AsyncFallback implements AsyncOptioner. The executor calls this
 // when an async dispatch is needed; the returned id becomes the
@@ -792,7 +965,7 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 		if rc != nil {
 			defer rc.PopContextTo(ctx.savedCtxPtr)
 		}
-		return f.fn(ctx)
+		return f.chain(ctx)
 	}
 
 	// Isolated-buffer path: render to a pooled buffer so we can
@@ -825,10 +998,10 @@ func (f *fluentComponent) Render(w ByteWriter, rc *RenderContext, data any) erro
 					renderErr = &panicValue{val: r}
 				}
 			}()
-			renderErr = f.fn(ctx)
+			renderErr = f.chain(ctx)
 		}()
 	} else {
-		renderErr = f.fn(ctx)
+		renderErr = f.chain(ctx)
 	}
 
 	// Panic path: discard buf, invoke boundary. The boundary

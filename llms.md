@@ -552,6 +552,45 @@ hydration: `x-data='{"min":0,"max":100}'`.
 - Single-quoted attribute: JSON has `"` but never `'`, so only
   apostrophes need escaping (escapeBytes handles all five anyway).
 
+### 9.6 Component middleware (.Use)
+
+React HOC pattern, router-agnostic:
+
+```go
+cr.Define("ADMIN_BUTTON").
+    Use(RequireAdmin, LogRender). // first = outermost
+    Render(func(c *render.ComponentContext) error { ... })
+```
+
+`type ComponentMiddleware func(ComponentRenderFunc) ComponentRenderFunc`.
+The chain folds ONCE at Register into `fluentComponent.chain`
+around a base that dispatches (async → forkAsync, sync → fn).
+The hot path calls one function pointer — zero iteration, zero
+alloc.
+
+CRITICAL topology (the security property): middleware wraps the
+DISPATCHER, not the inner render. The executor routes
+Dispatchable components through `fluentComponent.Dispatch` (in
+emitComponent, bcVM.dispatch, and renderComponent — all three).
+The chain runs on the main thread BEFORE the async fork: aborting
+(not calling next) prevents the fallback AND the worker. A
+`.Use(RequireAdmin)` component stays protected even if later
+marked `.Async()`. Middleware has full cascading context
+(c.UseContext) because it runs before the fork; the worker runs
+raw f.fn.
+
+Sync components: chain runs inside Render's machinery — OOB
+buffering, error-boundary recover, cascade auto-pop all wrap the
+middleware. Middleware writes join the component's output.
+
+Boundary: children are evaluated eagerly. Use .Use() for leaf
+gating, NOT massive layouts — router middleware for routes.
+
+`fluent.go` — Definition.Use, ComponentMiddleware, Dispatch,
+forkAsync, chain folding in Register.
+`component.go` — Dispatchable interface.
+`execute.go` / `bytecode.go` — executor routing.
+
 ---
 
 ## 10. HTMX first-class support

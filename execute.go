@@ -169,6 +169,30 @@ func emitComponent(w ByteWriter, rc *RenderContext, nodes NodeStream, i int, dat
 		return err
 	}
 
+	// Dispatchable components (fluent + middleware) handle their
+	// own dispatch — the middleware chain gates any async fork
+	// BEFORE the fallback is written or the worker spawned. The
+	// children and slots are collected eagerly (documented cost:
+	// middleware aborts still pay the pre-render; use router
+	// middleware for route-level gating).
+	if d, ok := c.(Dispatchable); ok {
+		children := collectChildHTML(rc, nodes, i, data)
+		slots := collectSlots(rc, nodes, i, data)
+		if len(slots) > 0 {
+			if data == nil {
+				data = make(map[string]any)
+			}
+			if m, ok := data.(map[string]any); ok {
+				m[SlotsDataKey] = slots
+			} else {
+				// Wrap non-map data.
+				wrapped := map[string]any{"_data": data, SlotsDataKey: slots}
+				data = wrapped
+			}
+		}
+		return d.Dispatch(w, rc, data, children)
+	}
+
 	// Async dispatch: write fallback inline, run render in a worker.
 	// Lazy — coordinator is only allocated the first time we hit an
 	// Async component during a render walk.
