@@ -1,0 +1,122 @@
+package render
+
+import (
+	"bytes"
+	"fmt"
+)
+
+// RenderPage is the high-level "render a page" helper. It composes
+// a layout + view + components in three steps:
+//
+//  1. Render the view to a buffer.
+//  2. Stash the view bytes on the RenderContext (rc.ViewBytes) for
+//     the yield() superpower.
+//  3. Render the layout. Components (e.g. <NAVBAR/>) are
+//     dispatched via the SoA executor; the layout's {{ yield }}
+//     reads rc.ViewBytes via the FuncMap superpower.
+//
+// Layout authors use `{{ yield }}` (FuncMap) or <YIELD/> (SoA
+// component) where the body should go:
+//
+//	<html><body><NAVBAR/>
+//	  {{ yield }}
+//	  <FOOTER/>
+//	</body></html>
+//
+// View authors write the inner content as a flat HTML template:
+//
+//	<h1>{{.Title}}</h1>
+//	<p>{{.Body}}</p>
+//
+// RenderPage is the only entry point users typically need.
+//
+// Errors returned by RenderPage are wrapped sentinels:
+//   - ErrRenderPageInvalid for empty layout or view
+//   - ErrLayoutMissing if the layout lookup fails
+//   - ErrTemplateNotFound for missing view
+//   - ErrLoaderMissing if the RenderContext has no loader
+//
+// Routers can use errors.Is to translate these to HTTP responses.
+func (r *Registry) RenderPage(rc *RenderContext, layout, view string, data any) error {
+	return r.RenderPageWith(rc, "html", layout, view, data)
+}
+
+// RenderPageWith is RenderPage with an explicit engine name. Use
+// this to compose a layout + view with an engine other than the
+// default plain HTML engine (e.g. "html-template" or "jade").
+func (r *Registry) RenderPageWith(rc *RenderContext, engine, layout, view string, data any) error {
+	if rc == nil {
+		return fmt.Errorf("%w: nil RenderContext", ErrRenderPageInvalid)
+	}
+	if layout == "" {
+		return ErrLayoutMissing
+	}
+	if view == "" {
+		return fmt.Errorf("%w: missing view", ErrRenderPageInvalid)
+	}
+	if engine == "" {
+		return fmt.Errorf("%w: missing engine", ErrRenderPageInvalid)
+	}
+
+	// Engines with native composition (templ) handle this themselves.
+	if eng := r.Engine(engine); eng != nil {
+		if pc, ok := eng.(PageComposer); ok {
+			return pc.RenderPage(rc, rc.Writer, layout, view, data)
+		}
+	}
+
+	// 1. Render the view to a buffer.
+	var viewBuf bytes.Buffer
+	viewBw := AcquireWriter(&viewBuf)
+	defer ReleaseWriter(viewBw)
+	viewRc := AcquireContext(viewBw, rc.Request)
+	defer ReleaseContext(viewRc)
+	viewRc.Loader = rc.Loader
+	viewRc.Variants = rc.Variants
+	viewRc.FuncMap = rc.FuncMap
+	viewRc.SetComponentRegistry(rc.ComponentRegistry())
+	if err := r.Render(viewRc, engine, view, data); err != nil {
+		return err
+	}
+	if err := viewBw.Flush(); err != nil {
+		return err
+	}
+
+	// 2. Stash the view bytes for the yield() superpower. The layout's
+	//    html/template reads this via the FuncMap closure. We also
+	//    register a YIELD component for engines that use the SoA
+	//    executor (plain HTML) where <YIELD/> is a component tag.
+	rc.ViewBytes = viewBuf.Bytes()
+	cr := rc.ComponentRegistry()
+	if cr == nil {
+		cr = NewComponentRegistry()
+		rc.SetComponentRegistry(cr)
+	}
+	viewBytes := viewBuf.Bytes()
+	yield := ComponentFunc(func(w ByteWriter, _ *RenderContext, _ any) error {
+		_, err := w.Write(viewBytes)
+		return err
+	})
+	cr.Register("YIELD", yield)
+	defer cr.Unregister("YIELD")
+
+	// 3. Render the layout.
+	return r.Render(rc, engine, layout, data)
+}
+
+// Unregister removes a component from the registry. Used internally
+// to clean up after RenderPage.
+func (r *ComponentRegistry) Unregister(name string) {
+	for {
+		old := r.components.Load()
+		newMap := make(map[string]Component, len(*old))
+		for k, v := range *old {
+			if k != name {
+				newMap[k] = v
+			}
+		}
+		if r.components.CompareAndSwap(old, &newMap) {
+			return
+		}
+	}
+}

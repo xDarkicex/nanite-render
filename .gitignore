@@ -1,0 +1,32 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build artifacts
+/bin/
+/dist/
+/coverage.out
+/coverage.html
+*.prof
+*.mem
+*.cpu
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Test / bench scratch
+/tmp/
+*.log
