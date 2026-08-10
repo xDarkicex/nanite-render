@@ -131,6 +131,12 @@ type RenderContext struct {
 	// Set via methods like SetHXRetarget; WriteHTMXHeaders applies
 	// the full set to the response writer at the end of the handler.
 	hmx HTMXResponse
+
+	// suspense is the lazily-allocated coordinator for Async
+	// components. Nil until the first Async component is hit during
+	// a render walk; see suspense.go.
+	suspense     *suspenseCoordinator
+	suspenseOnce sync.Once
 }
 
 // HTMXResponse bundles server-driven HTMX response decisions. The
@@ -257,6 +263,8 @@ func AcquireContext(w ByteWriter, req *http.Request) *RenderContext {
 	rc.hxTriggersAfterSwap = nil
 	rc.hxTriggersAfterSettle = nil
 	rc.hmx = HTMXResponse{}
+	rc.suspense = nil
+	rc.suspenseOnce = sync.Once{}
 	if rc.state == nil {
 		rc.state = NewState()
 	} else {
@@ -286,6 +294,8 @@ func ReleaseContext(rc *RenderContext) {
 	rc.hxTriggersAfterSwap = nil
 	rc.hxTriggersAfterSettle = nil
 	rc.hmx = HTMXResponse{}
+	rc.suspense = nil
+	rc.suspenseOnce = sync.Once{}
 	rcPool.Put(rc)
 }
 

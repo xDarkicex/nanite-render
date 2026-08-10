@@ -466,6 +466,43 @@ Uses `nanite:"key"` struct tags; default key is the lowercased field name.
 
 ---
 
+## Async / Suspense (server-side streaming)
+
+```go
+// Definition (fluent builder):
+func (d *Definition) Async() *Definition
+func (d *Definition) Fallback(fn ComponentRenderFunc) *Definition
+
+// AsyncOptioner interface (engines can implement directly):
+type AsyncOptioner interface {
+    Component
+    AsyncFallback() (id string, render func(w ByteWriter, rc *RenderContext, data any) error)
+}
+
+// RenderContext:
+func (rc *RenderContext) EnsureSuspense(w ByteWriter) *suspenseCoordinator
+func (rc *RenderContext) SubmitAsync(id string, fn func(w ByteWriter, rc *RenderContext, data any) error, data any)
+func (rc *RenderContext) CloseSuspense()
+func (rc *RenderContext) Suspense() *suspenseCoordinator
+```
+
+`Async()` opts a component into the suspense path: the executor
+writes the `Fallback` output inline, then runs the component's render
+in a background goroutine and emits the real output as a trailing OOB
+chunk wrapped in `<div id="<component>" hx-swap-oob="true">…</div>`.
+The fallback hits the wire immediately (TTFB ≈ 0ms); the real output
+arrives when the worker finishes.
+
+Turns `Sum(component_times)` into `Max(component_times)` for
+independent components. Cancellation is wired through
+`rc.Request.Context()`; a client disconnect aborts the worker and
+releases its pooled buffer.
+
+Coordinator is **lazy**: zero channels, zero goroutines, zero allocs
+on the non-async path.
+
+---
+
 ## SoA NodeStream
 
 ### `NodeStream`

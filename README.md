@@ -497,6 +497,7 @@ Every engine gets the framework's cross-cutting superpowers automatically:
 | `yield` | `{{ yield }}` | Injects the pre-rendered view body (layout composition) |
 | `useState` | `{{ useState "count" 0 }}` | React-style per-render state |
 | `get` / `set` | `{{ get "count" }}` / `{{ set "count" 5 }}` | State access |
+| `<SLOW_DATA/>` with `Async()` + `Fallback()` | Server-side Suspense — fallback hits the wire immediately, real output streams as an HTMX OOB chunk when the worker finishes | Turns `Sum(component_times)` into `Max(component_times)` |
 
 The `component` and `yield` superpowers are injected into the FuncMap of any engine that compiles via html/template (jade, html-template). The plain HTML engine uses the SoA executor's native `<COMPONENT/>` dispatch instead.
 
@@ -589,6 +590,39 @@ cr.Memoize("UserCard", func(rc *render.RenderContext, data any) string {
 ```
 
 Repeat keys serve the cached HTML directly — no re-render.
+
+---
+
+## Server-side `<Suspense>` (Async / Fallback)
+
+Slow components don't block the rest of the page. Opt in per-component with `Async()` + `Fallback()`:
+
+```go
+cr.Define("USER_PROFILE").
+    Async().
+    Fallback(func(c *render.ComponentContext) error {
+        // Skeleton hits the wire immediately (TTFB ≈ 0ms).
+        return c.WriteString(`<div id="profile" class="skeleton">Loading…</div>`)
+    }).
+    Render(func(c *render.ComponentContext) error {
+        // Expensive query / IO — runs in a worker goroutine.
+        user := db.LoadUser(c.Data.(ProfileID))
+        return c.WriteString(fmt.Sprintf(`<div id="profile">%s</div>`, user.Name))
+    }).
+    Register(cr)
+```
+
+When the executor hits `USER_PROFILE`:
+
+1. **Inline:** the Fallback output is written and flushed to the response immediately. The browser paints the skeleton.
+2. **Background:** a worker goroutine runs the render to a pooled buffer.
+3. **Streaming:** when the worker finishes, the buffered bytes are wrapped in `<div id="user_profile" hx-swap-oob="true">…</div>` and emitted as a trailing chunk.
+
+The win: `Sum(component_times)` becomes `Max(component_times)` for independent components. Cancellation is wired through `rc.Request.Context()` — a client disconnect aborts the worker and releases its buffer.
+
+The coordinator is **lazy** — zero channels, zero goroutines, zero allocations on the non-async path. Use `rc.Suspense()` to inspect whether suspense is in flight.
+
+Call `rc.CloseSuspense()` after the render walk completes (typically in a `defer` in the handler) so the trailing OOB chunks flush before the response closes.
 
 ---
 

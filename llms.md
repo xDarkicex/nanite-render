@@ -244,6 +244,40 @@ If you generate a template with `{{ component "NAVBAR" . }}`, ensure the
 component is registered via `reg.AttachComponents(cr)` **before** render,
 or it silently renders nothing.
 
+### 6.1 Async / Suspense (server-side streaming)
+
+Components declared with `Async()` + `Fallback()` opt into server-side
+streaming. The Fallback output is written inline and flushed
+immediately; the real render runs in a worker goroutine and the
+finished bytes arrive as a trailing HTMX OOB chunk
+(`<div id="<component>" hx-swap-oob="true">…</div>`).
+
+```go
+cr.Define("USER_PROFILE").
+    Async().
+    Fallback(func(c *render.ComponentContext) error {
+        return c.WriteString(`<div id="profile" class="skeleton">Loading…</div>`)
+    }).
+    Render(func(c *render.ComponentContext) error {
+        user := db.LoadUser(c.Data.(ProfileID))
+        return c.WriteString(fmt.Sprintf(`<div id="profile">%s</div>`, user.Name))
+    }).
+    Register(cr)
+```
+
+The coordinator is **lazy**: no channels, no goroutines, no allocs
+when no async component is in the tree. `rc.CloseSuspense()` flushes
+the trailing chunks (call it from a defer in the handler).
+
+The win is `Sum(component_times)` → `Max(component_times)` for
+independent components. Note that standard HTMX `hx-get` buffers the
+entire response body before swapping, so the visible win is server-
+side parallelism plus an immediate skeleton on the wire (browser
+paints the shell while the worker runs).
+
+Cancellation is wired through `rc.Request.Context()` — a client
+disconnect aborts the worker and releases its pooled buffer.
+
 ---
 
 ## 7. Sharp edges

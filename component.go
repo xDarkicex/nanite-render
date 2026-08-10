@@ -233,6 +233,26 @@ type OOBOptioner interface {
 	OOBID() string
 }
 
+// AsyncOptioner is an optional interface a Component implements to
+// participate in Suspense-style asynchronous rendering. Components
+// that opt in via AsyncFallback() have their render executed in a
+// background goroutine; the executor writes the fallback HTML
+// inline (TTFB ≈ 0ms for that region), then emits the real output
+// as a trailing OOB chunk when the worker finishes.
+//
+// Suspense trades Sum(component_times) for Max(component_times) on
+// independent components. It requires an http.Flusher-compatible
+// response writer; non-flushing writers fall back to synchronous
+// rendering of the slow component.
+//
+// Engines that pre-compile components can implement AsyncOptioner
+// directly. The fluent builder exposes this via
+// Definition.Async().Fallback(fn).
+type AsyncOptioner interface {
+	Component
+	AsyncFallback() (id string, render func(w ByteWriter, rc *RenderContext, data any) error)
+}
+
 // RenderComponent renders a named, registered component inline,
 // writing to w. It recovers the *RenderContext from ctx (see
 // WithContext), so a templ component can compose a nanite-render

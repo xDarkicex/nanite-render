@@ -202,6 +202,16 @@ type Definition struct {
 	render       ComponentRenderFunc
 	withChildren bool
 	oobID        string
+
+	// async marks this component for Suspense-style async rendering.
+	// When true and Fallback is set, the executor writes the fallback
+	// output inline and runs the main render in a background
+	// goroutine; the real output is emitted as a trailing OOB chunk.
+	async bool
+
+	// fallback is the synchronous placeholder rendered inline before
+	// the async render finishes. Required when async is true.
+	fallback ComponentRenderFunc
 }
 
 // WithFuncs declares the per-component FuncMap. The FuncMap is
@@ -253,19 +263,60 @@ func (d *Definition) WithOOB(targetID string) *Definition {
 	return d
 }
 
+// Async marks the component for Suspense-style asynchronous
+// rendering. Requires Fallback(fn) to set the placeholder; calling
+// Register without a fallback when Async() is set is a no-op.
+//
+// When the executor encounters an Async component:
+//   - It writes the Fallback output inline and flushes immediately
+//     so the browser paints the skeleton with TTFB ≈ 0ms.
+//   - It spawns a worker goroutine that runs Render to a pooled
+//     buffer.
+//   - When the worker finishes (or the request context cancels), the
+//     real output is emitted as a trailing OOB chunk via the
+//     suspense coordinator, wrapped in
+//     <div id="<component>" hx-swap-oob="true">...</div>.
+//
+// Async turns Sum(component_times) into Max(component_times) for
+// independent components. It is strictly opt-in and lazy: the
+// coordinator allocates no channels and no goroutines unless an
+// Async component is actually hit during the render walk.
+func (d *Definition) Async() *Definition {
+	d.async = true
+	return d
+}
+
+// Fallback sets the synchronous placeholder rendered inline before
+// the async component's real output is available. fn runs against
+// the same ComponentContext as Render — it can read props, write
+// placeholder markup, and emit any inline CSS/JS the skeleton needs.
+//
+// Fallback is required when Async() is used; calling Fallback
+// without Async() is harmless (no async dispatch happens) but the
+// fallback function never runs.
+func (d *Definition) Fallback(fn ComponentRenderFunc) *Definition {
+	d.fallback = fn
+	return d
+}
+
 // Register finalises the definition and registers it with the
 // ComponentRegistry.
 func (d *Definition) Register(cr *ComponentRegistry) {
 	if d.name == "" || d.render == nil {
 		return
 	}
+	// Async requires a fallback; if the user forgot to set one we
+	// silently downgrade to a synchronous render rather than panic.
+	async := d.async && d.fallback != nil
 	// Build a Component that delegates to the fluent function.
 	c := &fluentComponent{
 		name:         d.name,
 		fn:           d.render,
+		fallback:     d.fallback,
 		funcs:        d.funcs,
 		withChildren: d.withChildren,
 		oobID:        d.oobID,
+		async:        async,
 	}
 	cr.Register(d.name, c)
 }
@@ -303,14 +354,54 @@ func releaseOOBBuffer(buf *bytes.Buffer) {
 type fluentComponent struct {
 	name         string
 	fn           ComponentRenderFunc
+	fallback     ComponentRenderFunc
 	funcs        template.FuncMap
 	withChildren bool
 	oobID        string
+	async        bool
 }
 
 // OOBID implements OOBOptioner. Returns the target DOM element id
 // when the component was declared with WithOOB(), or "" otherwise.
 func (f *fluentComponent) OOBID() string { return f.oobID }
+
+// IsAsync reports whether the component declared Async(). The
+// executor checks this to decide whether to dispatch via the
+// suspense coordinator (write fallback + spawn worker) or render
+// synchronously.
+func (f *fluentComponent) IsAsync() bool { return f.async }
+
+// AsyncFallback implements AsyncOptioner. The executor calls this
+// when an async dispatch is needed; the returned id becomes the
+// OOB target id (defaulting to the component name lowercased),
+// and render is run in a worker goroutine.
+func (f *fluentComponent) AsyncFallback() (string, func(w ByteWriter, rc *RenderContext, data any) error) {
+	if !f.async {
+		return "", nil
+	}
+	// Capture the render function so we can pass it across the
+	// goroutine boundary without retaining the whole component.
+	fn := f.fn
+	return strings.ToLower(f.name), func(w ByteWriter, rc *RenderContext, data any) error {
+		ctx := &ComponentContext{
+			Writer:  w,
+			Context: rc,
+			Data:    data,
+			State:   getCompState(rc),
+			DataMap: asMap(data),
+		}
+		return fn(ctx)
+	}
+}
+
+// AsyncFallbackFunc returns the user-supplied Fallback function.
+// Returns nil when the component is not async.
+func (f *fluentComponent) AsyncFallbackFunc() ComponentRenderFunc {
+	if !f.async {
+		return nil
+	}
+	return f.fallback
+}
 
 // Render implements Component. It builds the ComponentContext from
 // the render arguments and delegates to the user's function. It is

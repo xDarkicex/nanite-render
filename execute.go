@@ -168,6 +168,17 @@ func emitComponent(w ByteWriter, rc *RenderContext, nodes NodeStream, i int, dat
 		_, err := io.WriteString(w, "<!-- missing component: "+name+" -->")
 		return err
 	}
+
+	// Async dispatch: write fallback inline, run render in a worker.
+	// Lazy — coordinator is only allocated the first time we hit an
+	// Async component during a render walk.
+	if ao, ok := c.(AsyncOptioner); ok && rc != nil {
+		id, fn := ao.AsyncFallback()
+		if id != "" && fn != nil {
+			return emitAsyncComponent(w, rc, c, id, fn, data)
+		}
+	}
+
 	// Collect children (nodes whose Parent == i) and pre-render them.
 	children := collectChildHTML(rc, nodes, i, data)
 	// Collect slots (children with FlagSlot set) and stash on the
@@ -367,3 +378,41 @@ func stringify(v any) string {
 }
 
 var errNilProgram = &ParseError{Msg: "Execute: nil program"}
+
+// emitAsyncComponent handles the Async dispatch: ensure the
+// coordinator is running, render the fallback inline (so the
+// browser sees the skeleton with TTFB ≈ 0ms), then spawn a worker
+// goroutine that renders the real component. The worker's bytes
+// arrive on the response as a trailing OOB chunk via the coordinator.
+func emitAsyncComponent(w ByteWriter, rc *RenderContext, c Component, id string, fn func(w ByteWriter, rc *RenderContext, data any) error, data any) error {
+	// Lazily start the coordinator. Returns nil if writer is nil —
+	// in that case we fall back to synchronous rendering of fn.
+	coord := rc.EnsureSuspense(w)
+	if coord == nil {
+		return fn(w, rc, data)
+	}
+	// Render the fallback inline. The fluent component exposes its
+	// Fallback function via AsyncFallbackFunc.
+	if fbComp, ok := c.(interface {
+		AsyncFallbackFunc() ComponentRenderFunc
+	}); ok && fbComp.AsyncFallbackFunc() != nil {
+		ctx := &ComponentContext{
+			Writer:  w,
+			Context: rc,
+			Data:    data,
+			State:   getCompState(rc),
+			DataMap: asMap(data),
+		}
+		if err := fbComp.AsyncFallbackFunc()(ctx); err != nil {
+			return err
+		}
+	}
+	// Flush so the fallback chunk hits the wire immediately.
+	if fw, ok := w.(interface{ Flush() error }); ok {
+		_ = fw.Flush()
+	}
+	// Spawn the worker. The coordinator handles cancellation, the
+	// pooled buffer, and the OOB chunk wrapping.
+	rc.SubmitAsync(id, fn, data)
+	return nil
+}

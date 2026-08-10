@@ -270,6 +270,16 @@ func (vm *bcVM) dispatch(name string, w ByteWriter, children Children, slots Slo
 		_, err := io.WriteString(w, "<!-- missing component: "+name+" -->")
 		return err
 	}
+	// Async dispatch: same as the tree executor's emitComponent —
+	// write fallback inline and run the render in a worker. The
+	// bytecode path is the default for plain HTML, so this is where
+	// most Async components will actually be hit.
+	if ao, ok := c.(AsyncOptioner); ok {
+		id, fn := ao.AsyncFallback()
+		if id != "" && fn != nil {
+			return emitAsyncComponent(w, vm.rc, c, id, fn, vm.data)
+		}
+	}
 	data := vm.data
 	if len(slots) > 0 {
 		if data == nil {

@@ -347,7 +347,18 @@ func (r *Registry) Render(rc *RenderContext, engine, name string, data any) erro
 // instead of a raw string, so callers use the constants or
 // CustomEngine(name) — a typo'd name is a compile error.
 func (r *Registry) RenderNamed(rc *RenderContext, engine EngineName, name string, data any) error {
-	return r.renderNamed(rc, engine.String(), name, data)
+	if err := r.renderNamed(rc, engine.String(), name, data); err != nil {
+		return err
+	}
+	// Drain any perFlushWriter / pooled writer so the bytes are
+	// visible. RenderStream manages its own flushing; this is for
+	// the one-shot Render path so callers don't have to remember.
+	if rc != nil {
+		if fw, ok := rc.Writer.(interface{ Flush() error }); ok {
+			return fw.Flush()
+		}
+	}
+	return nil
 }
 
 func (r *Registry) renderNamed(rc *RenderContext, engine, name string, data any) error {
@@ -713,5 +724,15 @@ func (r *Registry) RenderComponent(w ByteWriter, rc *RenderContext, name string,
 	if !ok {
 		return nil
 	}
-	return renderComponent(c, w, rc, props, nil)
+	if err := renderComponent(c, w, rc, props, nil); err != nil {
+		return err
+	}
+	// Drain any perFlushWriter / pooled writer so the bytes are
+	// visible to the underlying io.Writer. Without this, small
+	// components (below the perFlushWriter threshold) stay
+	// buffered until the caller flushes manually.
+	if fw, ok := w.(interface{ Flush() error }); ok {
+		return fw.Flush()
+	}
+	return nil
 }
