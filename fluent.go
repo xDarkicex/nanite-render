@@ -140,8 +140,11 @@ func (c *ComponentContext) UseState(key string, initial any) (any, func(any)) {
 // scope. Lookup is reverse-scan (newest first), so the nearest
 // binding wins.
 //
-// Panics if the stack overflows MaxContextDepth — that's a
-// programming bug, not a runtime condition.
+// No hard cap: bindings beyond the inline fast-path spill to a
+// heap slice so genuinely deep trees still work. There's no
+// panic — if you need hundreds of nested ambient contexts
+// you're probably doing it wrong, but the framework won't stop
+// you.
 //
 // Nil-safe: a nil receiver is a no-op.
 func (c *ComponentContext) ProvideContext(key string, val any) {

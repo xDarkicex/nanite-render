@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"html/template"
 	"sort"
 	"sync/atomic"
 	"unsafe"
@@ -170,7 +171,48 @@ func NewRegistry(engines ...Engine) *Registry {
 	// want custom emission.
 	r.components.Store(NewComponentRegistry())
 	r.components.Load().Register("PRELOADS", &preloadsComponent{r: r})
+	// Register a default FuncMap builder so templates get the
+	// standard helpers (useState, get, set, useContext) without
+	// any opt-in. Users can call WithFuncMap to merge their own
+	// helpers on top — see Registry.FuncMap for the merge logic.
+	r.FuncMap(defaultFuncMap)
 	return r
+}
+
+// defaultFuncMap returns the batteries-included template helper
+// set: useState, get, set (for per-render state), and useContext
+// (for cascading context). Users can register additional helpers
+// via WithFuncMap; the merge happens in InjectFuncMap so all
+// helpers stay visible to templates.
+func defaultFuncMap(rc *RenderContext) template.FuncMap {
+	return template.FuncMap{
+		"useState": func(key string, initial any) any {
+			if rc == nil || rc.state == nil {
+				return initial
+			}
+			return rc.state.UseState(key, initial)
+		},
+		"get": func(key string) any {
+			if rc == nil || rc.state == nil {
+				return nil
+			}
+			v, _ := rc.state.Get(key)
+			return v
+		},
+		"set": func(key string, val any) string {
+			if rc == nil || rc.state == nil {
+				return ""
+			}
+			rc.state.Set(key, val)
+			return ""
+		},
+		"useContext": func(key string) any {
+			if rc == nil {
+				return nil
+			}
+			return rc.GetContext(key)
+		},
+	}
 }
 
 // Cache returns the shared program cache, lazily creating it.

@@ -140,41 +140,43 @@ type RenderContext struct {
 
 	// ctxStack is the cascading-context stack. Components call
 	// ProvideContext to push (key, val) and UseContext to look up
-	// the nearest binding for a key (reverse-scan). The stack is
-	// hard-capped at MaxContextDepth to keep everything on the
-	// RenderContext itself — no heap slices, no maps, zero
-	// allocations on the hot path.
+	// the nearest binding for a key (reverse-scan).
 	//
-	// RenderContext is pool-allocated so this fixed-size array is
-	// persistent across AcquireContext/ReleaseContext. The
-	// stack pointer is reset in AcquireContext; per-render
+	// The first inlineCtxCap bindings live in inlineCtx — a
+	// fixed-size array on the RenderContext struct, persistent
+	// across pool reuse, zero allocations on the fast path.
+	// RenderContext is pool-allocated so this array is part of
+	// the pooled memory; no heap traffic for typical pages (a
+	// real page has 3-5 cascading contexts).
+	//
+	// If a render tree exceeds inlineCtxCap nested bindings
+	// (unusual; admin UIs with deeply nested layouts can), pushes
+	// spill into overflowCtx — a heap slice that grows as
+	// needed. The slow path still works, the framework never
+	// panics.
+	//
+	// The stack pointer is reset in AcquireContext; per-render
 	// pushes during the walk are unwound automatically by
 	// ComponentContext when each component's render returns.
-	ctxStack [MaxContextDepth]contextKV
-	ctxPtr   int
+	inlineCtx   [inlineCtxCap]contextKV
+	overflowCtx []contextKV
+	ctxPtr      int
 }
 
 // contextKV is one slot on the cascading-context stack. Stored
 // inline in RenderContext so pushes/pops are pure memory moves
-// (no allocation).
+// (no allocation) up to inlineCtxCap; spills to a heap slice
+// beyond that.
 type contextKV struct {
 	key string
 	val any
 }
 
-// MaxContextDepth is the hard cap on nested context bindings per
-// request. 16 is enough for any realistic UI — if you need more,
-// you probably want explicit prop passing instead.
-const MaxContextDepth = 16
-
-// errContextOverflow is returned (as a panic from ProvideContext)
-// when the stack exceeds MaxContextDepth. Components don't recover
-// from this — it's a programming error, not a runtime condition.
-var errContextOverflow = &contextError{msg: "render: context stack overflow (>16 nested ProvideContext calls)"}
-
-type contextError struct{ msg string }
-
-func (e *contextError) Error() string { return e.msg }
+// inlineCtxCap is the size of the zero-allocation inline array.
+// 32 × 32 bytes (string + any) = 1 KiB per RenderContext. 32
+// nested ambient contexts (theme, user, locale, CSRF, layout,
+// …) covers every realistic UI; deeper trees spill to the heap.
+const inlineCtxCap = 32
 
 // HTMXResponse bundles server-driven HTMX response decisions. The
 // router calls one method on RenderContext (e.g. SetHXRetarget) per
@@ -268,12 +270,13 @@ func (rc *RenderContext) SetVariant(dim, value string) {
 }
 
 // PushContext pushes (key, val) onto the cascading-context stack.
-// Nested bindings shadow outer ones (reverse-scan lookup). The
-// stack is hard-capped at MaxContextDepth; pushing beyond that
-// panics — it's a programming error, not a runtime condition.
+// Nested bindings shadow outer ones (reverse-scan lookup).
 //
-// RenderContext pooling keeps the array persistent across
-// requests, so each Push is a pure memory move (no allocation).
+// The first inlineCtxCap pushes land in the inline array on
+// RenderContext itself — zero allocation, persistent across pool
+// reuse. Beyond that, pushes spill into overflowCtx (a heap
+// slice) so genuinely deep trees don't panic. There is no hard
+// cap; the framework never panics on depth.
 //
 // Prefer ComponentContext.ProvideContext over calling this
 // directly — it auto-pops on the component's render scope exit
@@ -282,16 +285,29 @@ func (rc *RenderContext) PushContext(key string, val any) {
 	if rc == nil {
 		return
 	}
-	if rc.ctxPtr >= len(rc.ctxStack) {
-		panic(errContextOverflow)
+	kv := contextKV{key: key, val: val}
+	if rc.ctxPtr < inlineCtxCap {
+		rc.inlineCtx[rc.ctxPtr] = kv
+	} else {
+		// Spillover: heap slice for depth > inlineCtxCap. Index
+		// into the slice is offset by inlineCtxCap so logical
+		// positions stay contiguous across both storage areas.
+		overflowIdx := rc.ctxPtr - inlineCtxCap
+		if overflowIdx < len(rc.overflowCtx) {
+			rc.overflowCtx[overflowIdx] = kv
+		} else {
+			rc.overflowCtx = append(rc.overflowCtx, kv)
+		}
 	}
-	rc.ctxStack[rc.ctxPtr] = contextKV{key: key, val: val}
 	rc.ctxPtr++
 }
 
 // PopContextTo sets the stack pointer back to a saved index.
 // Used by ComponentContext to unwind pushes made during its
-// render frame so bindings don't leak out of scope.
+// render frame so bindings don't leak out of scope. Popped
+// slots are zeroed so the GC can reclaim any `any` values the
+// user pushed (without this, they'd stay reachable through the
+// stack slot until the next push overwrites them).
 func (rc *RenderContext) PopContextTo(savedPtr int) {
 	if rc == nil {
 		return
@@ -304,12 +320,28 @@ func (rc *RenderContext) PopContextTo(savedPtr int) {
 	if savedPtr > rc.ctxPtr {
 		savedPtr = rc.ctxPtr
 	}
-	// Clear the popped slots so GC can collect val if it holds
-	// the only reference. Without this, popped vals would stay
-	// reachable via the stack slot until the next push overwrites
-	// them.
-	for i := savedPtr; i < rc.ctxPtr; i++ {
-		rc.ctxStack[i] = contextKV{}
+	// Clear the popped slots in both storage areas.
+	for i := savedPtr; i < rc.ctxPtr && i < inlineCtxCap; i++ {
+		rc.inlineCtx[i] = contextKV{}
+	}
+	if rc.ctxPtr > inlineCtxCap {
+		// Some of the popped slots live in overflowCtx. Clear
+		// them; truncate the overflow slice if the pointer has
+		// dropped back into the inline range, so the heap slice
+		// doesn't grow unbounded across long-lived pool members.
+		overflowEnd := rc.ctxPtr - inlineCtxCap
+		if savedPtr >= inlineCtxCap {
+			for i := savedPtr - inlineCtxCap; i < overflowEnd; i++ {
+				rc.overflowCtx[i] = contextKV{}
+			}
+		} else {
+			// savedPtr is in inline range; clear the entire
+			// overflow slice (everything above is popped).
+			for i := range rc.overflowCtx {
+				rc.overflowCtx[i] = contextKV{}
+			}
+			rc.overflowCtx = rc.overflowCtx[:0]
+		}
 	}
 	rc.ctxPtr = savedPtr
 }
@@ -319,15 +351,22 @@ func (rc *RenderContext) PopContextTo(savedPtr int) {
 // key, or nil if no binding exists. Returns nil for a nil
 // receiver.
 //
-// O(n) in the stack depth — at MaxContextDepth=16 the loop is
-// fully unrolled and fits in a single cache line.
+// O(n) in the stack depth — at inlineCtxCap the loop is fully
+// cache-resident. Deeper trees still hit cache but pay an extra
+// indirect on the spillover.
 func (rc *RenderContext) GetContext(key string) any {
 	if rc == nil {
 		return nil
 	}
 	for i := rc.ctxPtr - 1; i >= 0; i-- {
-		if rc.ctxStack[i].key == key {
-			return rc.ctxStack[i].val
+		var kv contextKV
+		if i < inlineCtxCap {
+			kv = rc.inlineCtx[i]
+		} else {
+			kv = rc.overflowCtx[i-inlineCtxCap]
+		}
+		if kv.key == key {
+			return kv.val
 		}
 	}
 	return nil

@@ -549,29 +549,30 @@ func (rc *RenderContext) ContextDepth() int
 func (c *ComponentContext) ProvideContext(key string, val any)
 func (c *ComponentContext) UseContext(key string) any
 
-// Template bridge:
+// Template bridge (also auto-injected via the default FuncMap):
 func UseContextFunc(rc *RenderContext) any  // returns the useContext func
 
-const MaxContextDepth = 16  // hard cap; overflow panics
+// Default FuncMap helpers (auto-installed in every Registry):
+//   {{ useState "key" initial }} -> per-render state value
+//   {{ get "key" }}                -> read state
+//   {{ set "key" value }}          -> write state (returns "")
+//   {{ useContext "key" }}         -> cascading-context lookup
 ```
 
-A fixed-size `[16]contextKV` array lives on `*RenderContext`.
-Pushes are pure memory moves (zero alloc). Lookup scans the
-stack backwards (newest first) so inner bindings shadow outer
-ones — true cascading scope.
+A fixed-size `[32]contextKV` array lives on `*RenderContext`.
+The first 32 nested bindings land in this inline array — pushes
+are pure memory moves (zero alloc). Beyond that, bindings spill
+into a heap slice so genuinely deep trees don't panic. There is
+no hard cap.
 
 Scope isolation: the dispatcher pops the stack back to the
 saved depth when each component's render returns. Bindings
 made inside one component do NOT leak into siblings or
 parents.
 
-Template engine bridge: register `render.UseContextFunc(rc)`
-in your FuncMap and templates can call `{{ useContext "theme" }}`
-directly. Zero allocations, same stack as the fluent API.
-
-Overflow: `MaxContextDepth` pushes panic. That's a programming
-bug, not a runtime condition — if you need more than 16 nested
-bindings, prefer explicit prop passing.
+Default FuncMap: every Registry installs `useState`, `get`,
+`set`, and `useContext` in the per-request FuncMap. Templates
+call them directly — no opt-in.
 
 Async workers run against their own fresh `*RenderContext`
 (empty stack). They don't inherit cascading state from the

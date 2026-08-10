@@ -337,10 +337,11 @@ cr.Define("DEEP_BUTTON").
     })
 ```
 
-Mechanics: a fixed-size `[16]contextKV` array lives directly
-on `*RenderContext`. Pushes are pure memory moves (zero alloc).
-Lookup scans the stack backwards (newest first) so inner
-bindings shadow outer ones.
+Mechanics: a fixed-size `[32]contextKV` array lives directly
+on `*RenderContext`. The first 32 nested bindings land inline
+(pure memory moves, zero alloc). Beyond that, pushes spill
+into a heap slice so genuinely deep trees still work. No
+hard cap, no panic.
 
 Scope isolation: the dispatcher pops the stack back to the
 saved depth when each component's render returns. Bindings
@@ -348,13 +349,9 @@ made inside `LAYOUT.Render` are visible to `DEEP_BUTTON`
 (nested) but NOT to a sibling rendered after `LAYOUT`
 finishes.
 
-Templates: `render.UseContextFunc(rc)` returns a FuncMap
-helper. Pass it via `render.WithFuncMap(...)` and templates
-can call `{{ useContext "theme" }}` — same stack, same
-lookup, zero allocations.
-
-Hard cap at `render.MaxContextDepth` (16). Overflow panics —
-it's a programming bug, not a runtime condition.
+Default FuncMap: every Registry auto-installs `useState`,
+`get`, `set`, and `useContext` in the per-request FuncMap.
+Templates call them directly — batteries included, no opt-in.
 
 Async workers run against a fresh `*RenderContext` (empty
 stack). They don't inherit cascading state from the inline

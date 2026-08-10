@@ -678,13 +678,11 @@ cr.Define("DEEP_BUTTON").
     })
 ```
 
-**How it works:** a fixed-size `[16]contextKV` array lives directly on `*RenderContext`. `PushContext` is a pure memory move (zero alloc). `GetContext` scans the stack backwards (newest first), so inner bindings shadow outer ones — true cascading scope.
+**How it works:** a fixed-size `[32]contextKV` array lives directly on `*RenderContext`. The first 32 nested bindings land in this inline array — `PushContext` is a pure memory move (zero alloc). If a render tree exceeds 32 nested bindings (unusual — admin UIs with deeply nested layouts), pushes spill into a heap slice so the framework never panics.
 
 **Scope isolation:** the dispatcher pops the stack back to the saved depth when each component's render returns. Bindings made inside `LAYOUT.Render` are visible to `DEEP_BUTTON` (nested), but NOT to a sibling component rendered after `LAYOUT` finishes.
 
-**Templates too:** pass `render.UseContextFunc(rc)` into your FuncMap and templates can call `{{ useContext "theme" }}` directly — the same stack, zero allocations, type-asserted in the template.
-
-**Hard cap:** the stack overflows at 16 nested bindings (`render.MaxContextDepth`). That's a programming bug, not a runtime condition — the render panics with a clear message. If you need more, prefer explicit prop passing.
+**Templates too:** the default FuncMap already includes `useState`, `get`, `set`, and `useContext` — batteries included. Templates call `{{ useContext "theme" }}` directly, no opt-in.
 
 **Async workers** get a fresh `*RenderContext` (their own empty stack), so they don't inherit cascading state from the inline render. Provide what the worker needs in its `Fallback` or pass via props.
 

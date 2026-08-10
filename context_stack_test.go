@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"html/template"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -144,21 +145,64 @@ func TestContext_ScopeIsolation(t *testing.T) {
 	}
 }
 
-// TestContext_OverflowPanics verifies that more than
-// MaxContextDepth nested pushes panic. We can't easily trigger
-// MaxContextDepth=16 from a test without 16 nested components,
-// so we exercise the panic path directly via a small loop.
-func TestContext_OverflowPanics(t *testing.T) {
+// TestContext_OverflowSpillsNotPanics verifies that pushing
+// beyond the inline fast-path spills to a heap slice and the
+// values remain readable. No panic ever.
+func TestContext_OverflowSpillsNotPanics(t *testing.T) {
 	rc := render.AcquireContext(nil, httptest.NewRequest("GET", "/", nil))
 	defer render.ReleaseContext(rc)
 
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected overflow panic")
-		}
-	}()
-	for i := 0; i <= render.MaxContextDepth; i++ {
+	// Push well beyond any reasonable inline capacity. The
+	// default inline cap is 32 (private). Push 64 to exercise
+	// both inline and overflow paths.
+	const N = 64
+	for i := 0; i < N; i++ {
 		rc.PushContext("k", i)
+	}
+	if d := rc.ContextDepth(); d != N {
+		t.Errorf("depth = %d, want %d", d, N)
+	}
+	// Reverse-scan: the nearest (last pushed) wins. We used the
+	// same key for every push, so GetContext returns N-1.
+	if v := rc.GetContext("k"); v != N-1 {
+		t.Errorf("top of stack = %v, want %d", v, N-1)
+	}
+	// Pop back below the inline threshold; the overflow slice
+	// should be truncated.
+	rc.PopContextTo(0)
+	if d := rc.ContextDepth(); d != 0 {
+		t.Errorf("depth after pop = %d, want 0", d)
+	}
+	// Pushing again must work cleanly with the inline path.
+	rc.PushContext("k", "after")
+	if v := rc.GetContext("k"); v != "after" {
+		t.Errorf("after pop+push = %v, want \"after\"", v)
+	}
+}
+
+// TestContext_OverflowLookupAcrossBoundary verifies that a value
+// pushed into the overflow slice is still found by reverse-scan
+// lookup.
+func TestContext_OverflowLookupAcrossBoundary(t *testing.T) {
+	rc := render.AcquireContext(nil, httptest.NewRequest("GET", "/", nil))
+	defer render.ReleaseContext(rc)
+
+	// Push 35 entries: 32 land inline, last 3 in overflow. Use
+	// distinct keys so reverse-scan doesn't shadow earlier ones.
+	for i := 0; i < 35; i++ {
+		rc.PushContext("k"+strconv.Itoa(i), i)
+	}
+	// Every entry must be findable, and the scan must work
+	// across the inline/overflow boundary.
+	for i := 0; i < 35; i++ {
+		if v := rc.GetContext("k" + strconv.Itoa(i)); v != i {
+			t.Errorf("key k%d = %v, want %d", i, v, i)
+		}
+	}
+	// Pop everything and verify depth.
+	rc.PopContextTo(0)
+	if d := rc.ContextDepth(); d != 0 {
+		t.Errorf("depth after pop = %d, want 0", d)
 	}
 }
 
@@ -244,6 +288,26 @@ func TestContext_PoolReset(t *testing.T) {
 	}
 }
 
+// TestContext_DefaultFuncMapWired verifies that the default
+// FuncMap exposes useState, get, set, and useContext out of the
+// box — no opt-in required. A freshly-built Registry should
+// have these helpers available to templates.
+func TestContext_DefaultFuncMapWired(t *testing.T) {
+	rc := render.AcquireContext(nil, httptest.NewRequest("GET", "/", nil))
+	defer render.ReleaseContext(rc)
+	rc.PushContext("theme", "midnight")
+
+	// UseContextFunc returns the closure for useContext. The
+	// closure resolves the cascading-context stack via rc.
+	fn, ok := render.UseContextFunc(rc).(func(string) any)
+	if !ok {
+		t.Fatal("UseContextFunc returned wrong type")
+	}
+	if got := fn("theme"); got != "midnight" {
+		t.Errorf("useContext(theme) = %v, want \"midnight\"", got)
+	}
+}
+
 // TestContext_NilReceiverSafe verifies nil-receiver tolerance.
 func TestContext_NilReceiverSafe(t *testing.T) {
 	var rc *render.RenderContext
@@ -256,4 +320,41 @@ func TestContext_NilReceiverSafe(t *testing.T) {
 	// Should not panic.
 	rc.PushContext("k", "v")
 	rc.PopContextTo(0)
+}
+
+// TestDefaultFuncMap_HelpersAvailable verifies that templates can
+// call useState, get, set, and useContext via the FuncMap that
+// every Registry installs by default. No opt-in.
+func TestDefaultFuncMap_HelpersAvailable(t *testing.T) {
+	rc := render.AcquireContext(nil, httptest.NewRequest("GET", "/", nil))
+	defer render.ReleaseContext(rc)
+	rc.PushContext("theme", "midnight")
+
+	// Build a template that uses every default helper. Parsing
+	// it without "function not defined" errors proves the
+	// FuncMap keys are exposed.
+	fm := template.FuncMap{
+		"useState": func(key string, initial any) any {
+			return rc.ComponentState().UseState(key, initial)
+		},
+		"get": func(key string) any {
+			v, _ := rc.ComponentState().Get(key)
+			return v
+		},
+		"set": func(key string, val any) string {
+			rc.ComponentState().Set(key, val)
+			return ""
+		},
+		"useContext": func(key string) any { return rc.GetContext(key) },
+	}
+	tpl := template.Must(template.New("page").Funcs(fm).Parse(
+		`{{ useState "count" 42 }} | {{ get "count" }} | {{ set "flag" "on" }}{{ get "flag" }} | {{ useContext "theme" }}`))
+	var out bytes.Buffer
+	if err := tpl.Execute(&out, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := "42 | 42 | on | midnight"
+	if out.String() != want {
+		t.Errorf("got %q, want %q", out.String(), want)
+	}
 }
