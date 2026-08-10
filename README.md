@@ -542,6 +542,36 @@ err := reg.RenderPageWith(rc, render.EngineTempl, "layouts/app", "view", data)
 The layout and view both receive the framework context, so state, slots, and
 superpowers work inside templ too (`rc := render.FromContext(ctx)`).
 
+### Mixed-engine composition (the GO-Portfolio pattern)
+
+The handler names the view; the layout maps it in; partials are components.
+`RenderPageEngines` composes a layout and view rendered by **different**
+engines — the layout as plain HTML (compiled to bytecode, ~85 ns) with a
+`<YIELD/>` view slot, the view as templ (or jade, or html-template):
+
+```go
+// Layout file (plain HTML → bytecode):
+//   <html><body><NAVBAR/><YIELD/><FOOTER/></body></html>
+//
+// View: a templ component.
+eng.Register("posts/show", func(data any) templ.Component { return View(data) })
+
+// Partials: React-style components (memoizable).
+cr.Define("NAVBAR").Render(func(c *render.ComponentContext) error { ... }).Register(cr)
+cr.Memoize("NAVBAR", func(rc *render.RenderContext, data any) string { return "static" })
+
+// The handler call — name the view, the layout wraps it:
+err := reg.RenderPageEngines(rc,
+    render.EngineHTML,  "layouts/app",   // bytecode layout
+    render.EngineTempl, "posts/show",    // templ view
+    data)
+```
+
+Output: `<html><body><nav ...>nav</nav><h1>the post</h1><footer>footer</footer></body></html>`.
+The view is rendered to a buffer, the layout's `<YIELD/>` injects it, and the
+partials dispatch through the ComponentRegistry — with state, slots, props,
+and memoization available to every part.
+
 ### Per-component memoization
 
 GO-Portfolio cached each part; we apply the same idea per component.
