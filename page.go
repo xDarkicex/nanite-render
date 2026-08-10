@@ -45,6 +45,40 @@ func (r *Registry) RenderPage(rc *RenderContext, layout, view string, data any) 
 // this to compose a layout + view with an engine other than the
 // default plain HTML engine (e.g. "html-template" or "jade").
 func (r *Registry) RenderPageWith(rc *RenderContext, engine, layout, view string, data any) error {
+	// Engines with native composition (templ) handle this themselves.
+	if eng := r.Engine(engine); eng != nil {
+		if pc, ok := eng.(PageComposer); ok {
+			if rc == nil {
+				return fmt.Errorf("%w: nil RenderContext", ErrRenderPageInvalid)
+			}
+			return pc.RenderPage(rc, rc.Writer, layout, view, data)
+		}
+	}
+	return r.renderPageEngines(rc, engine, layout, engine, view, data)
+}
+
+// RenderPageEngines composes a layout and view rendered by DIFFERENT
+// engines — the GO-Portfolio dynamic-layout pattern. The handler
+// names the view; the layout wraps it; partials are components.
+//
+// Typical split: the layout is plain HTML (compiled to bytecode,
+// ~85 ns) with <YIELD/> where the view goes, and the view is templ
+// (or jade, or html-template):
+//
+//	reg.RenderPageEngines(rc,
+//	    render.EngineHTML, "layouts/app",   // bytecode layout
+//	    render.EngineTempl, "posts/show",   // templ view
+//	    data)
+//
+// The view is rendered to a buffer, then the layout is rendered with
+// a YIELD component injecting it. Components inside the layout
+// (partials like <NAVBAR/>) dispatch through the ComponentRegistry.
+func (r *Registry) RenderPageEngines(rc *RenderContext, layoutEngine EngineName, layout string, viewEngine EngineName, view string, data any) error {
+	return r.renderPageEngines(rc, layoutEngine.String(), layout, viewEngine.String(), view, data)
+}
+
+// renderPageEngines is the generic buffer+YIELD composition path.
+func (r *Registry) renderPageEngines(rc *RenderContext, layoutEngine, layout, viewEngine, view string, data any) error {
 	if rc == nil {
 		return fmt.Errorf("%w: nil RenderContext", ErrRenderPageInvalid)
 	}
@@ -54,18 +88,11 @@ func (r *Registry) RenderPageWith(rc *RenderContext, engine, layout, view string
 	if view == "" {
 		return fmt.Errorf("%w: missing view", ErrRenderPageInvalid)
 	}
-	if engine == "" {
+	if layoutEngine == "" || viewEngine == "" {
 		return fmt.Errorf("%w: missing engine", ErrRenderPageInvalid)
 	}
 
-	// Engines with native composition (templ) handle this themselves.
-	if eng := r.Engine(engine); eng != nil {
-		if pc, ok := eng.(PageComposer); ok {
-			return pc.RenderPage(rc, rc.Writer, layout, view, data)
-		}
-	}
-
-	// 1. Render the view to a buffer.
+	// 1. Render the view (viewEngine) to a buffer.
 	var viewBuf bytes.Buffer
 	viewBw := AcquireWriter(&viewBuf)
 	defer ReleaseWriter(viewBw)
@@ -75,7 +102,7 @@ func (r *Registry) RenderPageWith(rc *RenderContext, engine, layout, view string
 	viewRc.Variants = rc.Variants
 	viewRc.FuncMap = rc.FuncMap
 	viewRc.SetComponentRegistry(rc.ComponentRegistry())
-	if err := r.Render(viewRc, engine, view, data); err != nil {
+	if err := r.Render(viewRc, viewEngine, view, data); err != nil {
 		return err
 	}
 	if err := viewBw.Flush(); err != nil {
@@ -85,7 +112,7 @@ func (r *Registry) RenderPageWith(rc *RenderContext, engine, layout, view string
 	// 2. Stash the view bytes for the yield() superpower. The layout's
 	//    html/template reads this via the FuncMap closure. We also
 	//    register a YIELD component for engines that use the SoA
-	//    executor (plain HTML) where <YIELD/> is a component tag.
+	//    executor / bytecode (plain HTML) where <YIELD/> is a tag.
 	rc.ViewBytes = viewBuf.Bytes()
 	cr := rc.ComponentRegistry()
 	if cr == nil {
@@ -100,8 +127,9 @@ func (r *Registry) RenderPageWith(rc *RenderContext, engine, layout, view string
 	cr.Register("YIELD", yield)
 	defer cr.Unregister("YIELD")
 
-	// 3. Render the layout.
-	return r.Render(rc, engine, layout, data)
+	// 3. Render the layout (layoutEngine) — the bytecode path for
+	//    plain HTML, so a static layout is a handful of writes.
+	return r.Render(rc, layoutEngine, layout, data)
 }
 
 // Unregister removes a component from the registry. Used internally

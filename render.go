@@ -301,15 +301,16 @@ func (r *Registry) loadPart(eng Engine, engine, name string, rc *RenderContext) 
 		return p, nil
 	}
 	// Resolve source: use the loader if present; Sourceless engines
-	// (e.g. templ) don't need one — Compile ignores the bytes.
+	// (e.g. templ) never load — Compile ignores the bytes entirely.
+	_, sourceless := eng.(Sourceless)
 	var src []byte
-	if rc != nil && rc.Loader != nil {
+	if rc != nil && rc.Loader != nil && !sourceless {
 		var err error
 		src, err = rc.Loader(name)
 		if err != nil {
 			return nil, fmt.Errorf("%w %q: %w", ErrTemplateNotFound, name, err)
 		}
-	} else if _, ok := eng.(Sourceless); !ok {
+	} else if !sourceless {
 		return nil, fmt.Errorf("%w: %q", ErrLoaderMissing, name)
 	}
 	p, err := eng.Compile(src, name)

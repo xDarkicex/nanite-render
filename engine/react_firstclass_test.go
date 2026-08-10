@@ -231,3 +231,69 @@ func TestTempl_LayoutComposition(t *testing.T) {
 		t.Errorf("templ layout composition wrong: %q", out)
 	}
 }
+
+// TestGO_Portfolio_Pattern proves the original dynamic-layout flow:
+// the handler names the view, the bytecode layout wraps it in its
+// "view" slot, and partials are components. Layout = plain HTML
+// (bytecode), view = templ, partials = ComponentFunc (memoizable).
+func TestGO_Portfolio_Pattern(t *testing.T) {
+	// Partials: nav + footer as React-style components.
+	cr := render.NewComponentRegistry()
+	cr.Define("NAVBAR").
+		Render(func(c *render.ComponentContext) error {
+			_, err := c.WriteString("<nav class='navbar'>nav</nav>")
+			return err
+		}).
+		Register(cr)
+	cr.Define("FOOTER").
+		Render(func(c *render.ComponentContext) error {
+			_, err := c.WriteString("<footer>footer</footer>")
+			return err
+		}).
+		Register(cr)
+	// Partials can be memoized — render once, cache forever.
+	cr.Memoize("NAVBAR", func(rc *render.RenderContext, data any) string { return "static" })
+
+	// View: a templ component registered by name.
+	eng := NewTempl()
+	eng.Register("posts/show", func(data any) templ.Component {
+		return templ.ComponentFunc(func(ctx context.Context, w io.Writer) error {
+			_, err := io.WriteString(w, "<h1>the post</h1>")
+			return err
+		})
+	})
+
+	// Layout: plain HTML file with <YIELD/> (the view slot) and the
+	// partials. Compiled to bytecode by the plain HTML engine.
+	layoutSrc := `<html><body><NAVBAR/><YIELD/><FOOTER/></body></html>`
+	htmlEng := NewHTML()
+	reg := render.New(render.WithEngines(htmlEng, eng))
+	reg.AttachComponents(cr)
+	reg.SetDefaultLoader(render.NewMapLoader(map[string][]byte{
+		"layouts/app": []byte(layoutSrc),
+	}))
+
+	var buf bytes.Buffer
+	bw := render.AcquireWriter(&buf)
+	defer render.ReleaseWriter(bw)
+	rc := render.AcquireContext(bw, nil)
+	rc.Loader = reg.DefaultLoader()
+	rc.SetComponentRegistry(cr)
+	defer render.ReleaseContext(rc)
+
+	// The handler call: name the view, the layout maps it in.
+	if err := reg.RenderPageEngines(rc,
+		render.EngineHTML, "layouts/app", // bytecode layout
+		render.EngineTempl, "posts/show", // templ view
+		nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	want := "<html><body><nav class='navbar'>nav</nav><h1>the post</h1><footer>footer</footer></body></html>"
+	if out != want {
+		t.Errorf("GO-Portfolio composition wrong:\n got %q\nwant %q", out, want)
+	}
+}
