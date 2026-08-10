@@ -77,6 +77,54 @@ func (r *Registry) RenderPageEngines(rc *RenderContext, layoutEngine EngineName,
 	return r.renderPageEngines(rc, layoutEngine.String(), layout, viewEngine.String(), view, data)
 }
 
+// RenderStream renders a layout + view composition with progressive
+// HTTP streaming. The layout's bytes are emitted in chunks of
+// approximately chunkSize bytes; each chunk is pushed to the
+// underlying response writer and signaled via http.Flusher so it
+// hits the wire immediately. The browser starts parsing markup
+// before the full template has been rendered — TTFB drops to the
+// time the first chunk accumulates.
+//
+// chunkSize of 0 disables chunking (writes pass through to the
+// parent writer unchanged). Negative values are treated as 0.
+//
+// When the layout engine is a PageComposer (e.g. templ), the layout's
+// RenderPage handles streaming directly. For the engine-agnostic
+// buffer-injection path, the per-flush writer wraps the response
+// writer so the layout's bytecode writes stream incrementally.
+//
+// RenderStream is the streaming primitive for HTTP/1.1 chunked
+// encoding and HTTP/2 frame emission. Use it for slow-to-render
+// pages with substantial static content.
+func (r *Registry) RenderStream(rc *RenderContext, engine EngineName, layout, view string, data any, chunkSize int) error {
+	if rc == nil {
+		return fmt.Errorf("%w: nil RenderContext", ErrRenderPageInvalid)
+	}
+	if rc.Writer == nil {
+		return fmt.Errorf("%w: nil writer", ErrRenderPageInvalid)
+	}
+	// Wrap the per-request writer in a per-flush wrapper so the
+	// layout's bytes emit in chunks. Acquire/Release are scoped to
+	// this call — the wrapper is returned to its pool when done.
+	pw := AcquirePerFlushWriter(rc.Writer, chunkSize)
+	defer ReleasePerFlushWriter(pw)
+
+	// Swap rc.Writer for the wrapped writer for the duration of this
+	// call. Both paths (PageComposer and buffer-injection) write
+	// through rc.Writer, so a single swap covers both.
+	savedWriter := rc.Writer
+	rc.Writer = pw
+	defer func() { rc.Writer = savedWriter }()
+
+	// Engines with native composition (templ) handle this themselves.
+	if eng := r.Engine(engine.String()); eng != nil {
+		if pc, ok := eng.(PageComposer); ok {
+			return pc.RenderPage(rc, rc.Writer, layout, view, data)
+		}
+	}
+	return r.renderPageEngines(rc, engine.String(), layout, engine.String(), view, data)
+}
+
 // renderPageEngines is the generic buffer+YIELD composition path.
 func (r *Registry) renderPageEngines(rc *RenderContext, layoutEngine, layout, viewEngine, view string, data any) error {
 	if rc == nil {
