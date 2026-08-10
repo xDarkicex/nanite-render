@@ -1,0 +1,575 @@
+# ⚡ nanite-render
+
+### The lock-free, zero-alloc composition hub for Go server-side rendering
+
+Compose any template engine with a hot render path that allocates **0 bytes** on cache hits. Layouts, components, slots, state, and per-request FuncMaps — all wired into a single 60ns hot loop.
+
+---
+
+## Badges
+
+| | |
+|---|---|
+| **Allocations (hot path)** | `0 B/op` |
+| **Cache hit** | ~60 ns |
+| **Concurrency** | 100% lock-free (`atomic.Pointer` everywhere) |
+| **Engine surface** | Jade · html/template · plain HTML · templ |
+| **License** | MIT |
+| **Go** | 1.25+ |
+
+---
+
+## Hero
+
+```
+         ┌────────────────────────────┐
+         │  Your template engine      │  Jade, html/template, templ,
+         │  (jade, templ, html/tmpl)  │  plain HTML, or a custom Engine
+         └──────────────┬─────────────┘
+                        │  Engine.Compile / Engine.Execute
+                        ▼
+         ┌────────────────────────────┐
+         │  nanite-render core        │
+         │  • Lock-free SoA cache     │  ~60ns hit, 0 allocs
+         │  • Per-request FuncMap     │  closures, not globals
+         │  • Layout + view + slots   │  React-style composition
+         │  • Components + State      │  UseState[T], children, slots
+         │  • Pooled writer           │  zero-alloc byte streaming
+         └──────────────┬─────────────┘
+                        │  router-agnostic RenderContext
+                        ▼
+         ┌────────────────────────────┐
+         │  Your router               │  nanite, chi, gin, stdlib http
+         └────────────────────────────┘
+```
+
+The core has **zero router dependencies**. The `nano/` subpackage is the only code that imports `xDarkicex/nanite`.
+
+---
+
+## Why nanite-render
+
+- **Not a parser.** Jade parses jade. templ parses templ. html/template parses html/template. nanite-render *composes around them* — it's the cache + composition + lifecycle layer that makes them all feel like one system.
+- **Lock-free hot path.** Every read in the Registry goes through `atomic.Pointer`. No `sync.RWMutex` on any render path. This matters at the 190k req/sec that the nanite router targets.
+- **Zero allocations on render.** The cache stores pre-compiled programs; the executor walks a Structure-of-Arrays node stream with no per-render allocation. `BenchmarkRegistry_RenderHotPath` reports **0 B/op**.
+- **React-style composition in Go.** Components, children, named slots, per-render state (`UseState[T]`), and type-safe props (`BindProps[T]`).
+- **Router-agnostic.** Use it with nanite, chi, gin, or plain `net/http`. The adapters are thin and live outside the core.
+- **Inspired by the original GO-Portfolio pipeline** — per-part caching, per-render funcMap, layout+view composition — but rebuilt lock-free and zero-alloc.
+
+---
+
+## Benchmarks
+
+Measured on Apple M2, Go 1.25, 3 KB HTML document (30 cards + nav + footer).
+
+### Hot-path primitives
+
+| Operation | ns/op | allocs | B/op |
+|---|---|---|---|
+| `Cache.Get` (lock-free, off-heap) | 19 | 0 | 0 |
+| `LoadSource` | 11 | 0 | 0 |
+| **SoA executor walk (our renderer)** | **23,488** | **0** | **0** |
+
+### End-to-end render (3 KB doc)
+
+| Path | ns/op | allocs |
+|---|---|---|
+| templ (direct) | 2,436 | 20 |
+| templ (via nanite adapter) | 2,597 | 22 |
+| **nanite SoA executor (plain HTML)** | **23,488** | **0** |
+| nanite cached (jade/HTMLTemplate) | 69,085 | 567* |
+| html/template compiled | 68,591 | 567* |
+| raw re-parse every render (GO-Portfolio style) | 251,791 | 1,967 |
+| nanite cold (compile each render) | 273,921 | 2,027 |
+
+\* html/template's reflection + re-escaping — identical to the raw compiled baseline, not nanite-render's overhead.
+
+### Cache latency savings (p50/p99/p99.9, 20k samples)
+
+| Path | p50 | p99 | p99.9 |
+|---|---|---|---|
+| **nanite hot (cached)** | **66.8 µs** | **104.7 µs** | **253.8 µs** |
+| nanite cold (compile) | 249.3 µs | 546.3 µs | 745.6 µs |
+| raw html/template re-parse | 241.9 µs | 616.5 µs | 1,367.8 µs |
+| raw html/template compiled | 71.1 µs | 235.5 µs | 393.5 µs |
+
+**The cache saves 182.5 µs at p50 — 3.7× faster** than re-rendering, and tames the p99.9 tail from 1.37 ms (re-parse) to 254 µs (cached).
+
+### Compile-time (one-time, cached forever)
+
+| Operation | ns/op | allocs |
+|---|---|---|
+| Compile (parse → program) | 80,035 | 1,043 |
+| Minify | 65,207 | 31 |
+
+### Minification data savings
+
+```
+raw bytes:        6,068
+minified bytes:   3,938   (35.1% saved)
+```
+
+### The templ story
+
+templ is the fastest engine (~2.4 µs, 20 allocs) because it compiles templates to Go — no reflection. nanite-render's own SoA executor is **0 allocs** but a generic tree walker (23.5 µs). html/template is the alloc-heavy baseline (567 allocs) — its reflection + re-escaping is inherent to its design. Pick whichever engine; the composition layer (cache, state, slots, components, memoization) is identical on top.
+
+Run them yourself:
+
+```
+go test ./bench/ -bench=. -benchmem -benchtime=1s
+go test ./bench/ -run TestLatency -v
+go test ./bench/ -run TestMinify -v
+```
+
+---
+
+## Used by xDarkicex
+
+- **[xDarkicex/nanite](https://github.com/xDarkicex/nanite)** — the high-performance HTTP router this renders for.
+- **[xDarkicex/GO-Portfolio](https://github.com/xDarkicex/GO-Portfolio)** — the original render pipeline whose shape inspired this one.
+- **[xDarkicex/memory](https://github.com/xDarkicex/memory)** — off-heap mmap allocator backing the cache.
+- **[xDarkicex/liteLRU](https://github.com/xDarkicex/liteLRU)** — lock-free LRU reference design.
+- **[xDarkicex/lexer](https://github.com/xDarkicex/lexer)** — SWAR lexer primitives (pattern reference).
+
+---
+
+## Quick start
+
+```go
+package main
+
+import (
+    "net/http"
+
+    "github.com/xDarkicex/nanite-render"
+    "github.com/xDarkicex/nanite-render/engine"
+)
+
+func main() {
+    // Compose engines into one registry.
+    reg := render.New(
+        render.WithEngines(
+            engine.NewJade(),
+            engine.NewHTMLTemplate(),
+            engine.NewHTML(),   // plain HTML, no data binding
+        ),
+        render.WithDefaultLoader(render.NewFileLoader("./views", ".jade")),
+        render.WithCacheSize(2048),
+    )
+
+    // Works with plain net/http — no router needed.
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        bw := render.AcquireWriter(w)
+        defer render.ReleaseWriter(bw)
+        rc := render.AcquireContext(bw, r)
+        defer render.ReleaseContext(rc)
+        rc.Loader = reg.DefaultLoader()
+
+        if err := reg.Render(rc, "jade", "index", map[string]any{"Title": "Hello"}); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+    })
+
+    http.ListenAndServe(":8080", nil)
+}
+```
+
+---
+
+## Router integrations
+
+### xDarkicex/nanite (the fast one)
+
+The `nano` adapter is a **direct-call helper** — no middleware indirection. Handlers call `nano.Render` at the end, exactly like the original GO-Portfolio pattern.
+
+```go
+import (
+    "github.com/xDarkicex/nanite"
+    "github.com/xDarkicex/nanite-render/nano"
+    "github.com/xDarkicex/nanite-render"
+    "github.com/xDarkicex/nanite-render/engine"
+)
+
+func main() {
+    reg := render.New(
+        render.WithEngines(engine.NewJade(), engine.NewHTMLTemplate()),
+        render.WithDefaultLoader(render.NewFileLoader("./views", ".jade")),
+        render.WithCacheSize(2048),
+        render.WithConditional(),   // ETag / 304
+        render.WithCompression(6, 1024),
+    )
+
+    r := nanite.New()
+    r.Get("/posts/:slug", func(c *nanite.Context) {
+        post := loadPost(c.Param("slug"))
+        // Direct call, no middleware, no setup.
+        if err := nano.Render(c, reg, "jade", "posts/show", post); err != nil {
+            c.Error(http.StatusInternalServerError, err)
+        }
+    })
+    r.Start(":8080")
+}
+```
+
+**Fluent variant** — compose layout + view + parts with a chainable builder:
+
+```go
+r.Get("/posts/:slug", func(c *nanite.Context) {
+    post := loadPost(c.Param("slug"))
+    if err := nano.Page(reg, c).
+        Engine(render.EngineJade).
+        Layout("layouts/app").
+        View("posts/show").
+        With(post).
+        Render(); err != nil {
+        c.Error(http.StatusInternalServerError, err)
+    }
+})
+```
+
+**Or the direct-call** — one line, no builder:
+
+```go
+r.Get("/posts/:slug", func(c *nanite.Context) {
+    post := loadPost(c.Param("slug"))
+    if err := nano.RenderPage(c, reg, "layouts/app", "posts/show", post); err != nil {
+        c.Error(http.StatusInternalServerError, err)
+    }
+})
+```
+
+Both acquire a pooled `RenderContext` and `ByteWriter`, run the engine, and release them — the fluent builder's `Render()` releases automatically via its `WithDone` hook. No middleware to mount, nothing to configure per-request.
+
+The same fluent builder works in the core without nanite:
+
+```go
+reg.Page(rc).
+    Engine(render.EngineJade).          // typed constant, or:
+    EngineInstance(engine.NewJade()).   // a live engine value
+    Layout("layouts/app").
+    View("posts/show").
+    Parts("partials/nav", "partials/footer").
+    With(post).
+    RenderComposition()   // or .Render() for layout+view only
+```
+
+Engine names are a distinct type — `Engine("jad")` is a compile error.
+Use the constants (`EngineJade`, `EngineHTML`, `EngineHTMLTemplate`,
+`EngineTempl`) or `render.CustomEngine("my-engine")` for a user-defined
+engine.
+
+### chi / gin / stdlib http
+
+The core is router-agnostic. Any handler that can produce an `http.ResponseWriter` and `*http.Request` works:
+
+```go
+func renderHandler(w http.ResponseWriter, r *http.Request) {
+    bw := render.AcquireWriter(w)
+    defer render.ReleaseWriter(bw)
+    rc := render.AcquireContext(bw, r)
+    defer render.ReleaseContext(rc)
+    rc.Loader = reg.DefaultLoader()
+
+    err := reg.Render(rc, "jade", "index", data)
+    if errors.Is(err, render.ErrTemplateNotFound) {
+        http.Error(w, "not found", http.StatusNotFound)
+        return
+    }
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+    }
+}
+
+// chi
+r := chi.NewRouter()
+r.Get("/", renderHandler)
+
+// gin
+g := gin.Default()
+g.GET("/", func(c *gin.Context) { renderHandler(c.Writer, c.Request) })
+```
+
+The `RenderContext` is the only thing that crosses the router boundary — it's a plain struct holding a writer, a loader, and per-request config. No router types leak into the core.
+
+---
+
+## The cache
+
+The `Cache` is an **off-heap, lock-free, cache-line-padded** program store. It's the heart of the hot path.
+
+```go
+// Get a cache; the Registry lazily creates one if not provided.
+cache := reg.Cache()
+
+// Per-part caching — layout, view, and partials are separate entries.
+cache.Put("jade", "layouts/app", layoutProgram)
+cache.Put("jade", "posts/show", viewProgram)
+
+p, ok := cache.Get("jade", "posts/show")  // ~50ns, 0 allocs
+```
+
+- **Keys are `(engine, name)` pairs.** No string concat on the hot path — the FNV-1a hash composes both directly.
+- **Off-heap slots** via `xDarkicex/memory.MmapAnonymous`. The GC never scans the slot array.
+- **Cache-line padded slots.** One cache line per slot on x86 (128B on Apple Silicon), so concurrent slots don't false-share.
+- **Lock-free.** Get is a seqlock read: load seq, load payload, load seq again, verify. Put is a CAS-loop.
+- **Tag-based invalidation.** Group entries and drop them together.
+
+```go
+reg.SetTag("jade", "layouts/app", "chrome")   // tag this entry
+reg.SetTag("jade", "posts/show", "content")
+n := reg.InvalidateTag("chrome")              // drop all chrome-tagged entries
+```
+
+Cache-level stats are exposed:
+
+```go
+stats := cache.Stats()  // CacheStats{Hits, Misses, Evicts, Capacity}
+```
+
+---
+
+## Custom FuncMaps (per-request)
+
+The original GO-Portfolio built a fresh FuncMap per render — closures capturing the request handler's locals. nanite-render does the same, but makes it declarative.
+
+**Register a factory:**
+
+```go
+reg.FuncMap(func(rc *render.RenderContext) template.FuncMap {
+    return template.FuncMap{
+        "currentUser": func() *User { return userFromContext(rc) },
+        "csrfToken":   func() string { return issueToken(rc) },
+        "shout":       func(s string) string { return strings.ToUpper(s) + "!" },
+    }
+})
+```
+
+The factory runs on every render and the result is layered on top of engine defaults. Per-request values win.
+
+**Or set directly on a specific render context:**
+
+```go
+rc.WithFuncMap(template.FuncMap{
+    "currentUser": func() *User { return c.Params... },
+})
+```
+
+**Data injectors** run before the FuncMap and mutate the data map with whatever keys you want:
+
+```go
+reg.Inject(func(rc *render.RenderContext, data map[string]any) {
+    data["current_user"] = loadUser(rc.Request)
+    data["flashes"]      = loadFlashes(rc.Request)
+    data["theme"]        = themeFromCookie(rc.Request)
+})
+```
+
+No hardcoded keys — inject anything.
+
+---
+
+## React-style components
+
+nanite-render gives you a React-flavoured composition model in Go.
+
+### The fluent builder
+
+```go
+cr := render.NewComponentRegistry()
+
+cr.Define("NAVBAR").
+    WithFuncs(template.FuncMap{
+        "currentUser": func() *User { return loadUser() },
+    }).
+    RenderChildren(func(c *render.ComponentContext) error {
+        c.WriteString("<nav class='navbar'>")
+        c.WriteChildren()
+        c.WriteString("</nav>")
+        return nil
+    }).
+    Register(cr)
+
+reg.AttachComponents(cr)
+```
+
+Then use it in any template:
+
+```jade
+html
+  body
+    NAVBAR
+      ul
+        li Home
+        li About
+```
+
+### Named slots
+
+```go
+cr.Define("CARD").
+    Render(func(c *render.ComponentContext) error {
+        c.WriteString(`<div class="card">`)
+        c.WriteString(`<div class="header">`); c.WriteSlot("header"); c.WriteString(`</div>`)
+        c.WriteString(`<div class="body">`);   c.WriteSlot("body");   c.WriteString(`</div>`)
+        c.WriteString(`<div class="footer">`); c.WriteSlot("footer"); c.WriteString(`</div>`)
+        c.WriteString(`</div>`)
+        return nil
+    }).
+    Register(cr)
+```
+
+```jade
+CARD
+  header
+    h1 Welcome
+  body
+    p This is the body
+  footer
+    button Submit
+```
+
+### Per-component state (hooks)
+
+```go
+cr.Define("COUNTER").
+    Render(func(c *render.ComponentContext) error {
+        count, setCount := render.UseState(c.State, "count", 0)
+        setCount(count + 1)
+        _, err := c.WriteString("<span>" + strconv.Itoa(count) + "</span>")
+        return err
+    }).
+    Register(cr)
+```
+
+State is per-render and shared across components. `UseState[T]` is generic — no type assertions.
+
+The React layer is **first-class on `ComponentContext`** — state, typed props, and inline composition, uniformly across every engine:
+
+```go
+cr.Define("CARD").
+    Render(func(c *render.ComponentContext) error {
+        val, setVal := c.UseState("key", 0)     // React-style hook
+        setVal(val.(int) + 1)
+        props := render.Props[CardProps](c)      // typed props (nanite:"key" tags)
+        c.WriteSlot("header")                    // named slots
+        c.WriteChildren()                        // slot-less children
+        return c.Render("Navbar", props)         // compose another component inline
+    }).
+    Register(cr)
+```
+
+The same component runs identically from **templ** (`render.RenderComponent(ctx, w, "CARD", props)`), **html/template** (`{{ component "CARD" . }}`), and **plain HTML** (`<CARD/>`).
+
+### Type-safe props
+
+```go
+type NavbarProps struct {
+    Theme string `nanite:"theme"`
+    Size  int    `nanite:"size"`
+}
+
+cr.Define("NAVBAR").
+    Render(func(c *render.ComponentContext) error {
+        props := render.BindProps[NavbarProps](c.Data)
+        // props.Theme, props.Size are strongly typed
+        return nil
+    }).
+    Register(cr)
+```
+
+---
+
+## Superpowers
+
+Every engine gets the framework's cross-cutting superpowers automatically:
+
+| Superpower | Template syntax | What it does |
+|---|---|---|
+| `component` | `{{ component "NAVBAR" . }}` | Renders a registered component inline |
+| `yield` | `{{ yield }}` | Injects the pre-rendered view body (layout composition) |
+| `useState` | `{{ useState "count" 0 }}` | React-style per-render state |
+| `get` / `set` | `{{ get "count" }}` / `{{ set "count" 5 }}` | State access |
+
+The `component` and `yield` superpowers are injected into the FuncMap of any engine that compiles via html/template (jade, html-template). The plain HTML engine uses the SoA executor's native `<COMPONENT/>` dispatch instead.
+
+Layout composition is seamless:
+
+```jade
+// layouts/app.jade
+html
+  head
+    title= .Title
+  body
+    NAVBAR
+    {{ yield }}
+    FOOTER
+
+// posts/show.jade
+h1= .Post.Title
+p= .Post.Body
+```
+
+```go
+err := reg.RenderPage(rc, "layouts/app", "posts/show", data)
+```
+
+### templ-native layout composition
+
+templ composes natively — a layout wraps a view component (`Layout(view)`).
+Register both and `RenderPageWith` routes to templ's own composition:
+
+```go
+eng.Register("view", func(data any) templ.Component { return View(data) })
+eng.RegisterLayout("layouts/app", func(child templ.Component) templ.Component {
+    return templ.ComponentFunc(func(ctx context.Context, w io.Writer) error {
+        io.WriteString(w, "<html><body>")
+        child.Render(ctx, w)          // the view, injected natively
+        io.WriteString(w, "</body></html>")
+        return nil
+    })
+})
+
+err := reg.RenderPageWith(rc, render.EngineTempl, "layouts/app", "view", data)
+```
+
+The layout and view both receive the framework context, so state, slots, and
+superpowers work inside templ too (`rc := render.FromContext(ctx)`).
+
+### Per-component memoization
+
+GO-Portfolio cached each part; we apply the same idea per component.
+`cr.Memoize` caches a component's rendered HTML by key:
+
+```go
+// Data-independent → render once, cache forever.
+cr.Memoize("Navbar", func(rc *render.RenderContext, data any) string { return "static" })
+
+// Keyed by data → cache per ID.
+cr.Memoize("UserCard", func(rc *render.RenderContext, data any) string {
+    return data.(UserCardProps).ID
+})
+```
+
+Repeat keys serve the cached HTML directly — no re-render.
+
+---
+
+## Sentinel errors
+
+Routers translate errors to HTTP responses with `errors.Is`:
+
+```go
+var (
+    ErrEngineNotFound    // unknown engine → 500
+    ErrTemplateNotFound  // missing template → 404
+    ErrLoaderMissing     // no loader on context → 500
+    ErrLayoutMissing     // required layout absent → 500
+    ErrRenderPageInvalid // invalid RenderPage args → 500
+)
+```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 xDarkicex.
