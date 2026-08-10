@@ -317,7 +317,111 @@ or it silently renders nothing.
 
 ---
 
-## 10. Quick reference cheat-sheet
+## 10. HTMX first-class support
+
+nanite-render implements 100% of the HTMX 2.0 server-side contract:
+request detection, every trigger lifecycle, every response header, and
+OOB swap emission. Routers remain in charge of the wire and lifecycle;
+the renderer is purely about producing HTMX-aware bytes and headers.
+
+### When to use what
+
+- **`hx-get` / `hx-post` handler** → `reg.RenderComponent(bw, rc, name, props)`
+  renders a single component as the response, no parent template.
+- **Dirty component updates** → opt in with `cr.Define("X").WithOOB("x-id")`;
+  when `SetState`/`UseState` mutates state during render, output is
+  auto-wrapped in `<div id="x-id" hx-swap-oob="true">…</div>`. Clean
+  renders write through unchanged.
+- **Trigger client events** → `c.AddHXTrigger(name)` or
+  `c.AddHXTriggerWithDetail(name, any)` from inside a component's render.
+  Three trigger sets: `HX-Trigger`, `HX-Trigger-After-Swap`,
+  `HX-Trigger-After-Settle`.
+- **Server-driven decisions** (`retarget`, `reswap`, `push-url`,
+  `redirect`, `refresh`, `replace-url`, `location`, `reselect`,
+  `resettle`) → call the matching `SetHX*` method during the handler,
+  then `rc.WriteHTMXHeaders(w)` once at the end.
+
+### Key API surface
+
+```go
+// Request detection (nil-safe, pure functions)
+render.IsHTMXRequest(r)
+render.IsHTMXBoosted(r)
+render.IsHTMXHistoryRestore(r)
+render.HXTargetID(r)
+render.HXTriggerID(r)
+render.TriggerName(r)
+render.CurrentURL(r)
+render.HXPromptResponse(r)
+
+// Direct dispatch (HTMX-targeted components)
+reg.RenderComponent(bw, rc, "CARD", props)
+
+// OOB opt-in
+cr.Define("CARD").WithOOB("card-slot").Render(func(c *render.ComponentContext) error {
+    // SetState/UseState inside → auto OOB wrap on emit
+    // AddHXTrigger inside → event fires after swap
+}).Register(cr)
+
+// All 12 response headers (one setter each)
+rc.AddHXTrigger(name)
+rc.AddHXTriggerWithDetail(name, detail)
+rc.AddHXTriggerAfterSwap(name)
+rc.AddHXTriggerAfterSettle(name)
+rc.SetHXRetarget(selector)
+rc.SetHXReswap(strategy)
+rc.SetHXPushURL(url)
+rc.SetHXRedirect(url)
+rc.SetHXRefresh()
+rc.SetHXReplaceURL(url)
+rc.SetHXLocation(url)
+rc.SetHXReselect(selector)
+rc.SetHXResettle("true"|"false")
+
+// Apply all of the above to the response writer
+rc.WriteHTMXHeaders(w)
+```
+
+### Handler pattern
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+    bw := render.AcquireWriter(w); defer render.ReleaseWriter(bw)
+    rc := render.AcquireContext(bw, r); defer render.ReleaseContext(rc)
+
+    if render.IsHTMXHistoryRestore(r) {
+        reg.RenderPage(rc, "layout", "view", nil)
+    } else if render.IsHTMXRequest(r) {
+        reg.RenderComponent(bw, rc, "CARD", data)
+        rc.SetHXRetarget("#main")
+    } else {
+        reg.RenderPage(rc, "layout", "view", data)
+    }
+    rc.WriteHTMXHeaders(w)  // emits every HX-* header the handler set
+}
+```
+
+### Conventions for generated HTMX code
+
+- Always pair `AcquireContext`/`ReleaseContext` and
+  `AcquireWriter`/`ReleaseWriter` with `defer`. The per-request state
+  (`hxTriggers`, `hxTriggersAfterSwap`, `hxTriggersAfterSettle`,
+  `hmx`, `componentRegistry`) is cleared on Acquire/Release — don't
+  leak across handlers.
+- `WithOOB(targetID string)` requires an explicit target id. The id is
+  a hard DOM contract; do not infer from the component name.
+- `AddHXTriggerWithDetail` upgrades an entry to carry JSON detail.
+  `Join()` auto-selects the wire format (plain comma list when no entry
+  has detail, JSON object otherwise).
+- Auto-trigger on dirty OOB emits the lowercased component name;
+  components that want different event names add them explicitly
+  (both coexist, dedup keeps the set clean).
+- All `SetHX*` methods are nil-safe on `*RenderContext`. All header
+  writes are nil-safe on `http.ResponseWriter`.
+
+---
+
+## 11. Quick reference cheat-sheet
 
 ```go
 // Construct

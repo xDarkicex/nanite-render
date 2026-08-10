@@ -14,6 +14,7 @@ Compose any template engine with a hot render path that allocates **0 bytes** on
 | **Cache hit** | ~60 ns |
 | **Concurrency** | 100% lock-free (`atomic.Pointer` everywhere) |
 | **Engine surface** | Jade · html/template · plain HTML · templ |
+| **HTMX** | 100% first-class (all 12 response headers + OOB + 3 trigger lifecycles) |
 | **License** | MIT |
 | **Go** | 1.25+ |
 
@@ -588,6 +589,188 @@ cr.Memoize("UserCard", func(rc *render.RenderContext, data any) string {
 ```
 
 Repeat keys serve the cached HTML directly — no re-render.
+
+---
+
+## HTMX — first-class support (100% of the 2.0 spec)
+
+nanite-render has full, native support for the HTMX 2.0 request/response
+contract — request detection, OOB swaps, every trigger lifecycle, every
+server-driven response header. The router remains in charge of the wire;
+the renderer is purely about producing the right HTMX-aware bytes and
+headers for any given request.
+
+### Direct component dispatch (`hx-get` / `hx-post`)
+
+Render one named component to a `ByteWriter` without a parent template or
+layout — the handler for `hx-get="/posts/123/card"`:
+
+```go
+err := reg.RenderComponent(bw, rc, "CARD", props)
+```
+
+Missing name is a no-op (no error, no output) — stale HTMX targets don't
+crash the handler.
+
+### Out-of-Band swaps (`hx-swap-oob="true"`)
+
+Opt a component in with an explicit target DOM id. When the component's
+render mutates state via `SetState`/`UseState`, its output is wrapped in
+`<div id="<id>" hx-swap-oob="true">…</div>` and emitted automatically.
+Clean renders write through unchanged — no buffer copy on the no-op path:
+
+```go
+cr.Define("CARD").
+    WithOOB("card-slot").                            // required target id
+    Render(func(c *render.ComponentContext) error {
+        _, set := c.UseState("count", 0)
+        set(c.GetState("count").(int) + 1)          // marks frame dirty
+        return c.WriteString("<div class='card'>…</div>")
+    }).
+    Register(cr)
+```
+
+The render buffer comes from a `sync.Pool` of `bytes.Buffer` — zero
+steady-state allocations even on the dirty path. The wrapper is HTML-escaped.
+
+`rc.SetOOBSink(w)` redirects the OOB output to a separate writer when the
+router wants to interleave OOB swaps with a different stream.
+
+### HTMX request detection
+
+Pure helpers over `*http.Request`, nil-safe:
+
+```go
+render.IsHTMXRequest(r)              // canonical: HX-Request: true
+render.IsHTMXBoosted(r)              // HX-Boosted
+render.IsHTMXHistoryRestore(r)       // HX-History-Restore-Request
+render.HXTargetID(r)                 // id of the targeted element
+render.HXTriggerID(r)                // id of the triggered element
+render.TriggerName(r)                // name attribute of the trigger
+render.CurrentURL(r)                 // URL of the page that initiated the request
+render.HXPromptResponse(r)           // user's answer to an hx-prompt dialog
+```
+
+A typical handler branches on these:
+
+```go
+if render.IsHTMXHistoryRestore(r) {
+    // Serve the full page; HTMX is rebuilding its history snapshot.
+    reg.RenderPage(rc, "layout", "view", data)
+} else if render.IsHTMXRequest(r) {
+    // Targeted swap: render one component, then write HTMX headers.
+    reg.RenderComponent(bw, rc, "CARD", props)
+} else {
+    // Full page load.
+    reg.RenderPage(rc, "layout", "view", data)
+}
+```
+
+### Trigger events (`HX-Trigger`, `HX-Trigger-After-Swap`, `HX-Trigger-After-Settle`)
+
+Components accumulate event names during their render. The router writes
+the joined set into the response headers — but `rc.WriteHTMXHeaders(w)`
+does it in one call:
+
+```go
+// In the component:
+c.AddHXTrigger("card-updated")
+c.AddHXTriggerWithDetail("item-changed", map[string]any{"id": 42})
+c.AddHXTriggerAfterSwap("settled")
+c.AddHXTriggerAfterSettle("done")
+
+// In the handler:
+rc.WriteHTMXHeaders(w)
+```
+
+`AddHXTriggerWithDetail` upgrades an entry to carry JSON detail. The
+format is automatic: plain comma-separated names when no entry has detail,
+JSON object otherwise — matching HTMX's wire format:
+
+```
+HX-Trigger: card-updated,nav-refresh                          # plain
+HX-Trigger: {"item-changed":{"id":42},"card-updated":null}   # JSON detail
+```
+
+### Server-driven response decisions
+
+Every `HX-*` decision header is one setter on `RenderContext`. Apply them
+all in one call at the end of the handler:
+
+```go
+rc.SetHXRetarget("#main-panel")
+rc.SetHXReswap("outerHTML swap:200ms")
+rc.SetHXPushURL("true")             // or a URL
+rc.SetHXRedirect("/done")           // full URL required
+rc.SetHXRefresh()                   // full client refresh
+rc.SetHXReplaceURL("/current")      // or "true"
+rc.SetHXLocation("/alt")            // navigation without history
+rc.SetHXReselect("#content")        // CSS selector for response extraction
+rc.SetHXResettle("true")            // "true" forces scroll reset
+
+rc.WriteHTMXHeaders(w)              // emits only the headers actually set
+```
+
+Every header is covered:
+
+| Header | Setter | Constant |
+|---|---|---|
+| `HX-Trigger` | `AddHXTrigger` / `AddHXTriggerWithDetail` | `render.HXTriggerHeader` |
+| `HX-Trigger-After-Swap` | `AddHXTriggerAfterSwap` | `render.HXTriggerAfterSwap` |
+| `HX-Trigger-After-Settle` | `AddHXTriggerAfterSettle` | `render.HXTriggerAfterSettle` |
+| `HX-Retarget` | `SetHXRetarget` | `render.HXRetarget` |
+| `HX-Reswap` | `SetHXReswap` | `render.HXReswapHeader` |
+| `HX-Push-Url` | `SetHXPushURL` | `render.HXPushURL` |
+| `HX-Redirect` | `SetHXRedirect` | `render.HXRedirect` |
+| `HX-Refresh` | `SetHXRefresh` | `render.HXRefresh` |
+| `HX-Replace-Url` | `SetHXReplaceURL` | `render.HXReplaceURL` |
+| `HX-Location` | `SetHXLocation` | `render.HXLocation` |
+| `HX-Reselect` | `SetHXReselect` | `render.HXReselect` |
+| `HX-Resettle` | `SetHXResettle` | `render.HXResettle` |
+
+### Auto-OOB → auto-trigger
+
+When a `WithOOB` component's render dirties state, the lowercased
+component name is **automatically added** to `HX-Trigger`. Components
+that want different event names call `AddHXTrigger` explicitly — both
+coexist (dedup keeps the set clean):
+
+```go
+// CARD with WithOOB("card-slot") that mutates state →
+// HX-Trigger: card     (auto, from name)
+// HX-Trigger: custom-event  (if c.AddHXTrigger("custom-event") also called)
+```
+
+### Complete handler pattern
+
+The full router integration in one function:
+
+```go
+func PostHandler(w http.ResponseWriter, r *http.Request) {
+    bw := render.AcquireWriter(w)
+    defer render.ReleaseWriter(bw)
+    rc := render.AcquireContext(bw, r)
+    defer render.ReleaseContext(rc)
+
+    if render.IsHTMXHistoryRestore(r) {
+        reg.RenderPage(rc, "layout", "view", nil)
+    } else if render.IsHTMXRequest(r) {
+        reg.RenderComponent(bw, rc, "CARD", postData)
+        // Component already added "card" to rc.HXTriggers via WithOOB.
+        rc.SetHXRetarget("#post-feed")
+        rc.SetHXReswap("outerHTML settle:200ms")
+    } else {
+        reg.RenderPage(rc, "layout", "view", postData)
+    }
+
+    // Writes HX-Trigger, HX-Retarget, HX-Reswap — only the headers
+    // actually set during the handler.
+    rc.WriteHTMXHeaders(w)
+}
+```
+
+One call to `WriteHTMXHeaders` writes all accumulated HTMX decisions;
+the router stays in charge of the wire and lifecycle.
 
 ---
 

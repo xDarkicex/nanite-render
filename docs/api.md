@@ -723,6 +723,188 @@ Adapts pre-compiled templ components. Note: does not implement the full
 
 ---
 
+## HTMX — first-class support
+
+nanite-render implements 100% of the HTMX 2.0 server-side contract.
+The router remains in charge of the wire; the renderer is purely about
+producing HTMX-aware bytes and headers.
+
+### Request detection (pure helpers)
+
+All functions take `*http.Request` and are nil-safe.
+
+```go
+func IsHTMXRequest(r *http.Request) bool             // HX-Request: true
+func IsHTMXBoosted(r *http.Request) bool             // HX-Boosted: true
+func IsHTMXHistoryRestore(r *http.Request) bool      // HX-History-Restore-Request: true
+func HXTargetID(r *http.Request) string              // HX-Target
+func HXTriggerID(r *http.Request) string             // HX-Trigger
+func TriggerName(r *http.Request) string             // HX-Trigger-Name
+func CurrentURL(r *http.Request) string              // HX-Current-URL
+func HXPromptResponse(r *http.Request) string        // HX-Prompt
+```
+
+### Header constants
+
+Request headers (client → server) and response headers (server →
+client). The same wire name serves both directions for `HX-Trigger`;
+the alias `HXTriggerHeader` exists for code that handles both sides.
+
+```go
+const (
+    HXRequest               = "HX-Request"
+    HXBoosted               = "HX-Boosted"
+    HXHistoryRestoreRequest = "HX-History-Restore-Request"
+    HXTarget                = "HX-Target"
+    HXTrigger               = "HX-Trigger"
+    HXTriggerName           = "HX-Trigger-Name"
+    HXCurrentURL            = "HX-Current-URL"
+    HXPrompt                = "HX-Prompt"
+
+    // Response headers
+    HXTriggerHeader        = "HX-Trigger"
+    HXTriggerAfterSwap     = "HX-Trigger-After-Swap"
+    HXTriggerAfterSettle   = "HX-Trigger-After-Settle"
+    HXRetarget             = "HX-Retarget"
+    HXReswapHeader         = "HX-Reswap"
+    HXPushURL              = "HX-Push-Url"
+    HXRedirect             = "HX-Redirect"
+    HXRefresh              = "HX-Refresh"
+    HXReplaceURL           = "HX-Replace-Url"
+    HXLocation             = "HX-Location"
+    HXReselect             = "HX-Reselect"
+    HXResettle             = "HX-Resettle"
+)
+```
+
+### Direct component dispatch
+
+```go
+func (r *Registry) RenderComponent(w ByteWriter, rc *RenderContext, name string, props any) error
+```
+
+Renders one named component to `w` without a parent template or layout.
+Missing name returns `nil` (no error, no output) — stale HTMX targets
+don't crash the handler.
+
+### OOB swaps
+
+```go
+func (d *Definition) WithOOB(targetID string) *Definition
+```
+
+Opt a component in. `targetID` is required and is a hard DOM contract
+(it must match the `id` attribute of the element the swap replaces).
+When the component's render mutates state via `SetState`/`UseState`,
+output is auto-wrapped in `<div id="<targetID>" hx-swap-oob="true">…</div>`
+and emitted. Clean renders write through unchanged — no buffer copy on
+the no-op path. The render buffer comes from a `sync.Pool` of
+`bytes.Buffer` — zero steady-state allocations.
+
+### OOBOptioner interface
+
+```go
+type OOBOptioner interface {
+    Component
+    OOBID() string
+}
+```
+
+Engines that pre-compile components (templ, html/template) implement
+this directly to participate in OOB tracking without using the fluent
+builder. The fluent `WithOOB(id)` becomes shorthand for a
+`OOBOptioner`-implementing wrapper.
+
+### OOB sink
+
+```go
+func (rc *RenderContext) SetOOBSink(w ByteWriter)
+func (rc *RenderContext) OOBSink() ByteWriter
+```
+
+Optional separate writer for OOB swap output. Falls back to `rc.Writer`
+when nil. Most handlers leave this nil; routers that want to interleave
+OOB swaps with a different stream (e.g. an SSE trailing chunk) can
+set it here.
+
+### Trigger events
+
+```go
+func (rc *RenderContext) AddHXTrigger(name string)
+func (rc *RenderContext) AddHXTriggerWithDetail(name string, detail any)
+func (rc *RenderContext) HXTriggers() HXTriggers
+func (rc *RenderContext) AddHXTriggerAfterSwap(name string)
+func (rc *RenderContext) HXTriggersAfterSwap() HXTriggers
+func (rc *RenderContext) AddHXTriggerAfterSettle(name string)
+func (rc *RenderContext) HXTriggersAfterSettle() HXTriggers
+
+// ComponentContext convenience (nil-safe)
+func (c *ComponentContext) AddHXTrigger(name string)
+func (c *ComponentContext) AddHXTriggerWithDetail(name string, detail any)
+func (c *ComponentContext) AddHXTriggerAfterSwap(name string)
+func (c *ComponentContext) AddHXTriggerAfterSettle(name string)
+```
+
+`HXTriggers` is `map[string]any` so entries can carry JSON detail.
+`HXTriggers.Join()` auto-selects the wire format:
+- Plain comma-separated names when no entry has detail
+- JSON object when any entry carries detail
+
+```go
+type HXTriggers map[string]any
+func (t HXTriggers) Add(name string)
+func (t HXTriggers) AddWithDetail(name string, detail any)
+func (t HXTriggers) Names() []string             // sorted
+func (t HXTriggers) HasDetail() bool
+func (t HXTriggers) Join() string               // "" when empty
+```
+
+### HTMXResponse — server-driven decisions
+
+```go
+type HTMXResponse struct {
+    Retarget   string  // CSS selector
+    Reswap     string  // e.g. "outerHTML swap:200ms"
+    PushURL    string  // "true" or a URL
+    Redirect   string  // full URL
+    Refresh    string  // "true"
+    ReplaceURL string  // "true" or a URL
+    Location   string  // full URL
+    Reselect   string  // CSS selector
+    Resettle   string  // "true" forces scroll reset
+}
+
+func (rc *RenderContext) SetHXRetarget(selector string)
+func (rc *RenderContext) SetHXReswap(strategy string)
+func (rc *RenderContext) SetHXPushURL(url string)
+func (rc *RenderContext) SetHXRedirect(url string)
+func (rc *RenderContext) SetHXRefresh()
+func (rc *RenderContext) SetHXReplaceURL(url string)
+func (rc *RenderContext) SetHXLocation(url string)
+func (rc *RenderContext) SetHXReselect(selector string)
+func (rc *RenderContext) SetHXResettle(value string)
+func (rc *RenderContext) HTMXResponse() HTMXResponse
+```
+
+### WriteHTMXHeaders
+
+```go
+func (rc *RenderContext) WriteHTMXHeaders(w http.ResponseWriter)
+```
+
+Applies every accumulated HTMX response decision to the writer in one
+call. Nil-safe on both receiver and writer. Headers whose source is
+empty are skipped so the response carries only what the handler set.
+
+### Auto-trigger on dirty OOB
+
+When an OOB-enabled component's render dirties state, the lowercased
+component name is automatically added to `HX-Trigger`. Clean renders
+emit no trigger. User-added triggers via `c.AddHXTrigger(...)` coexist
+with the auto one — dedup keeps the set clean.
+
+---
+
 ## nano sub-package (`.../nano`)
 
 Direct-call helpers for the nanite router. No middleware.
