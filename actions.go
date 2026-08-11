@@ -280,12 +280,14 @@ func parseActionBody(req *http.Request) map[string]any {
 	if strings.Contains(req.Header.Get("Content-Type"), "application/json") {
 		var m map[string]any
 		_ = json.NewDecoder(req.Body).Decode(&m)
+		if m == nil {
+			// Empty or null body — always hand actions a writable
+			// map so `props["k"] = v` never panics.
+			return map[string]any{}
+		}
 		return m
 	}
 	_ = req.ParseForm()
-	if len(req.PostForm) == 0 {
-		return nil
-	}
 	m := make(map[string]any, len(req.PostForm))
 	for k, vs := range req.PostForm {
 		if len(vs) == 0 {

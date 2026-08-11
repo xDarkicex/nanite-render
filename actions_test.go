@@ -363,3 +363,41 @@ func TestAction_ActionErrorYields500(t *testing.T) {
 		t.Errorf("re-render happened despite action error: %q", rec.Body.String())
 	}
 }
+
+// TestAction_EmptyBodyPropsWritable verifies an action receiving an
+// empty POST body still gets a non-nil, writable props map — a
+// regression for the "assignment to entry in nil map" panic when an
+// action body writes to props (e.g. props["count"] = n).
+func TestAction_EmptyBodyPropsWritable(t *testing.T) {
+	var wrote bool
+	cr := render.NewComponentRegistry()
+	cr.Define("COUNTER").
+		Action("increment", func(rc *render.RenderContext, props map[string]any) error {
+			props["count"] = 1 // must not panic
+			wrote = true
+			return nil
+		}).
+		Render(func(c *render.ComponentContext) error { return nil }).
+		Register(cr)
+	reg := render.New()
+	reg.AttachComponents(cr)
+
+	// Form-encoded empty body.
+	rec := doAction(reg, "/_nano/action/COUNTER/increment", nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("form empty body: status = %d", rec.Code)
+	}
+	if !wrote {
+		t.Fatal("action did not run")
+	}
+
+	// JSON empty body.
+	wrote = false
+	rec = doAction(reg, "/_nano/action/COUNTER/increment", nil, "application/json")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json empty body: status = %d", rec.Code)
+	}
+	if !wrote {
+		t.Fatal("action did not run for json body")
+	}
+}
