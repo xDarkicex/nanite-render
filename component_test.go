@@ -2,6 +2,8 @@ package render
 
 import (
 	"bytes"
+	"fmt"
+	"sync/atomic"
 	"html/template"
 	"testing"
 )
@@ -104,4 +106,77 @@ func TestComponentWithFuncs_HTMLTemplate(t *testing.T) {
 	}).WithFuncs(template.FuncMap{
 		"greet": func() string { return "Hello" },
 	}))
+}
+
+// TestMemoComponent_DelegatesOptionalInterfaces verifies Memoize
+// preserves the inner component's capabilities: a memoized
+// component with a colocated action still dispatches it, and the
+// memo cache still serves repeated keys on the dispatch path.
+func TestMemoComponent_DelegatesOptionalInterfaces(t *testing.T) {
+	cr := NewComponentRegistry()
+	var renders int32
+
+	cr.Define("TOGGLE").
+		Action("flip", func(rc *RenderContext, props map[string]any) error {
+			props["on"] = !props["on"].(bool)
+			return nil
+		}).
+		Render(func(c *ComponentContext) error {
+			atomic.AddInt32(&renders, 1)
+			on := c.Data.(map[string]any)["on"].(bool)
+			if on {
+				_, err := c.WriteString("<b>on</b>")
+				return err
+			}
+			_, err := c.WriteString("<b>off</b>")
+			return err
+		}).
+		Register(cr)
+	cr.Memoize("TOGGLE", func(rc *RenderContext, data any) string {
+		return fmt.Sprint(data.(map[string]any)["on"])
+	})
+
+	// The memo wrapper must still expose the action.
+	c, ok := cr.Lookup("TOGGLE")
+	if !ok {
+		t.Fatal("component not registered")
+	}
+	ap, isAction := c.(ActionProvider)
+	if !isAction {
+		t.Fatalf("memoized component lost ActionProvider: %T", c)
+	}
+	if _, found := ap.LookupAction("flip"); !found {
+		t.Fatal("memoized component lost its action")
+	}
+
+	// Dispatch twice with the same props — the second render must
+	// be served from the memo cache (render count stays 1).
+	disp, isDispatchable := c.(Dispatchable)
+	if !isDispatchable {
+		t.Fatalf("memoized component lost Dispatchable: %T", c)
+	}
+	renderTo := func(props map[string]any) string {
+		var buf bytes.Buffer
+		bw := AcquireWriter(&buf)
+		rc := AcquireContext(bw, nil)
+		rc.SetComponentRegistry(cr)
+		defer ReleaseContext(rc)
+		if err := disp.Dispatch(bw, rc, props, nil); err != nil {
+			t.Fatalf("dispatch: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		return buf.String()
+	}
+
+	if got := renderTo(map[string]any{"on": false}); got != "<b>off</b>" {
+		t.Fatalf("first render = %q", got)
+	}
+	if got := renderTo(map[string]any{"on": false}); got != "<b>off</b>" {
+		t.Fatalf("second render = %q", got)
+	}
+	if n := atomic.LoadInt32(&renders); n != 1 {
+		t.Fatalf("expected 1 render (memo hit), got %d", n)
+	}
 }

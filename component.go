@@ -22,6 +22,67 @@ type memoComponent struct {
 
 // Render implements Component.
 func (m *memoComponent) Render(w ByteWriter, rc *RenderContext, data any) error {
+	return m.renderOrCache(w, rc, data, nil)
+}
+
+// Dispatch implements Dispatchable — memoized fluent components
+// (middleware, actions, async, OOB) keep their full dispatch path.
+func (m *memoComponent) Dispatch(w ByteWriter, rc *RenderContext, data any, children Children) error {
+	return m.renderOrCache(w, rc, data, children)
+}
+
+// RenderWithChildren implements ComponentWithChildren.
+func (m *memoComponent) RenderWithChildren(w ByteWriter, rc *RenderContext, data any, children Children) error {
+	return m.renderOrCache(w, rc, data, children)
+}
+
+// LookupAction implements ActionProvider — a memoized component
+// with colocated server actions still dispatches them.
+func (m *memoComponent) LookupAction(name string) (ActionFunc, bool) {
+	if ap, ok := m.inner.(ActionProvider); ok {
+		return ap.LookupAction(name)
+	}
+	return nil, false
+}
+
+// OOBID implements OOBOptioner.
+func (m *memoComponent) OOBID() string {
+	if o, ok := m.inner.(OOBOptioner); ok {
+		return o.OOBID()
+	}
+	return ""
+}
+
+// AsyncFallback implements AsyncOptioner — memoized async
+// components keep their fallback + worker stream.
+func (m *memoComponent) AsyncFallback() (string, func(w ByteWriter, rc *RenderContext, data any) error) {
+	if a, ok := m.inner.(AsyncOptioner); ok {
+		return a.AsyncFallback()
+	}
+	return "", nil
+}
+
+// Metadata implements MetadataProvider.
+func (m *memoComponent) Metadata() func(rc *RenderContext, data any) error {
+	if mp, ok := m.inner.(MetadataProvider); ok {
+		return mp.Metadata()
+	}
+	return nil
+}
+
+// ComponentFuncs implements ComponentWithFuncs.
+func (m *memoComponent) ComponentFuncs() template.FuncMap {
+	if cf, ok := m.inner.(ComponentWithFuncs); ok {
+		return cf.ComponentFuncs()
+	}
+	return nil
+}
+
+// renderOrCache is the shared memo path: cache-hit writes the
+// stored HTML, miss renders the inner component (through Dispatch
+// when available, so fluent machinery — middleware, async forks,
+// OOB — keeps working), stores, and writes.
+func (m *memoComponent) renderOrCache(w ByteWriter, rc *RenderContext, data any, children Children) error {
 	key := m.keyer(rc, data)
 	if key != "" {
 		if html, ok := m.reg.memoHTML(m.name, key); ok {
@@ -32,7 +93,14 @@ func (m *memoComponent) Render(w ByteWriter, rc *RenderContext, data any) error 
 	// Render to a buffer.
 	var buf bytes.Buffer
 	bw := AcquireWriter(&buf)
-	err := m.inner.Render(bw, rc, data)
+	var err error
+	if d, ok := m.inner.(Dispatchable); ok {
+		err = d.Dispatch(bw, rc, data, children)
+	} else if cw, ok := m.inner.(ComponentWithChildren); ok && children != nil {
+		err = cw.RenderWithChildren(bw, rc, data, children)
+	} else {
+		err = m.inner.Render(bw, rc, data)
+	}
 	if ferr := bw.Flush(); err == nil {
 		err = ferr
 	}
