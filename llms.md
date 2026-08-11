@@ -363,6 +363,39 @@ stack). They don't inherit cascading state from the inline
 render — pass what the worker needs via props or set it in
 the `Fallback`.
 
+### 6.4 Component Memoization (Memoize)
+
+`cr.Memoize` caches a component's rendered HTML by a user-supplied
+key. Repeated renders with the same key skip the render walk
+entirely and serve the cached output. The keyer receives
+`(rc, data)` and returns a `string`; returning `""` skips the cache
+for that render:
+
+```go
+cr.Define("USER_CARD").
+    Render(func(c *render.ComponentContext) error {
+        user := c.Data.(UserCardProps)
+        // ... expensive HTML generation ...
+    }).
+    Register(cr)
+cr.Memoize("USER_CARD", func(rc *render.RenderContext, data any) string {
+    return data.(UserCardProps).ID   // cache per user ID
+})
+```
+
+Mechanics: `memoComponent` wraps the original component. On render,
+it computes the key via the keyer, checks an in-memory map
+(`map[string]map[string]string`, keyed by component name then
+cache key), and returns cached bytes on hit. On miss, it renders
+the inner component into a buffer, stores the result, and returns
+it. The cache is per-registry, bounded only by available memory
+(no TTL, no eviction — use it for data-independent or low-
+cardinality components).
+
+Best fit: navbars, static panels, user cards keyable by ID,
+product tiles. The keyer returning `""` is the escape hatch
+for renders that should never be cached.
+
 ---
 
 ## 7. Sharp edges
