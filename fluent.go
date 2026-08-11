@@ -88,6 +88,25 @@ func (c *ComponentContext) Write(p []byte) (int, error) { return c.Writer.Write(
 // WriteString writes a string to the output.
 func (c *ComponentContext) WriteString(s string) (int, error) { return c.Writer.WriteString(s) }
 
+// Yield writes the pre-rendered view body (rc.ViewBytes) to the
+// output — the layout composition hook. In the two-pass page
+// pipeline, RenderPage renders the view first and stashes the
+// bytes on the RenderContext; layouts call Yield where the view
+// body should appear. Emitted by the gsx @yield directive.
+//
+// Standalone renders (no RenderPage) have empty ViewBytes — Yield
+// writes nothing.
+func (c *ComponentContext) Yield() error {
+	if c == nil || c.Writer == nil || c.Context == nil {
+		return nil
+	}
+	if len(c.Context.ViewBytes) == 0 {
+		return nil
+	}
+	_, err := c.Writer.Write(c.Context.ViewBytes)
+	return err
+}
+
 // WriteHydrateProps serializes props as JSON into a single-quoted
 // HTML attribute — the hydration bridge for Alpine.js (x-data),
 // HTMX extensions, and vanilla JS:

@@ -426,7 +426,16 @@ func (c *ComponentContext) Write(p []byte) (int, error)
 func (c *ComponentContext) WriteString(s string) (int, error)
 func (c *ComponentContext) WriteChildren()
 func (c *ComponentContext) WriteSlot(name string)
+func (c *ComponentContext) Yield() error
 ```
+
+`Yield()` writes the pre-rendered view body (`rc.ViewBytes`)
+to the output — the layout composition hook. In the two-pass
+page pipeline, `RenderPage` renders the view first and stashes
+the bytes on the RenderContext; layouts call `Yield()` where
+the view body should appear. Standalone renders (no
+`RenderPage`) have empty `ViewBytes` — `Yield()` writes
+nothing. Emitted by the gsx `@yield` directive.
 
 ### Children & Slots
 

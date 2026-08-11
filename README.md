@@ -385,6 +385,7 @@ nanite-render gives you a React-flavoured composition model in Go — components
 | JSX component | `cr.Define("NAME").Render(fn).Register(cr)` — the [fluent builder](#the-fluent-builder) |
 | Props | `c.Data` + [`render.BindProps[T]`](#type-safe-props) — typed, zero-alloc |
 | `props.children` | [`c.WriteChildren()`](#named-slots) + named slots `c.WriteSlot("name")` |
+| Layouts (`layout.tsx` / `children` in layout) | [`c.Yield()`](#layout-composition-with-yield) — writes the pre-rendered view body in the two-pass pipeline |
 | `useState` / state hooks | [`c.UseState(key, initial)` / `render.UseState[T]`](#per-component-state-hooks) |
 | Context (`createContext` / `useContext`) | [`c.ProvideContext` / `c.UseContext`](#cascading-context-react-style-zero-alloc) — zero-alloc stack, auto-scoped |
 | Error Boundaries (`componentDidCatch`) | [`cr.Define(...).ErrorBoundary(fn)`](#error-boundaries-panic-isolation) |
@@ -565,6 +566,23 @@ p= .Post.Body
 ```go
 err := reg.RenderPage(rc, "layouts/app", "posts/show", data)
 ```
+
+### Component-level yield (`c.Yield()`)
+
+For component-based layouts (gsx, fluent components), `ComponentContext.Yield()` writes the pre-rendered view body:
+
+```go
+cr.Define("APP_LAYOUT").
+    Render(func(c *render.ComponentContext) error {
+        c.WriteString(`<html><body><main>`)
+        if err := c.Yield(); err != nil { return err }
+        c.WriteString(`</main></body></html>`)
+        return nil
+    }).
+    Register(cr)
+```
+
+`Yield()` writes `rc.ViewBytes` — set by the two-pass pipeline after rendering the view, before the layout renders. Standalone renders write nothing. This is the hook the gsx `@yield` directive compiles to.
 
 ### templ-native layout composition
 
